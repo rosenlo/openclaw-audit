@@ -278,6 +278,14 @@ def classify_litellm_entry(msg):
 
 
 # ─── OpenClaw 事件分类 ─────────────────────────────────────────────
+def _parse_int_field(part):
+    """Parse `key=value` into int, or None when value is non-numeric
+    (e.g. OpenClaw emits `messages=NaN` at the precheck stage)."""
+    try:
+        return int(part.split("=", 1)[1])
+    except (ValueError, IndexError):
+        return None
+
 def classify_entry(msg, level):
     ml = msg.lower()
     cat = {}
@@ -321,10 +329,14 @@ def classify_entry(msg, level):
         cat["subtype"] = "precheck" if "precheck" in ml else ("diagnostic" if "diag" in ml else "detected")
         for part in msg.split():
             if part.startswith("messages="):
-                try:
-                    cat["msg_count"] = int(part.split("=")[1])
-                except (ValueError, IndexError):
-                    pass
+                # OpenClaw emits `messages=NaN` when messageCount is unresolved
+                # at the precheck stage; int("NaN") raises, so fall back to None
+                # rather than silently dropping the field (which renders as `?`).
+                cat["msg_count"] = _parse_int_field(part)
+            elif part.startswith("estimatedPromptTokens="):
+                cat["est_prompt_tokens"] = _parse_int_field(part)
+            elif part.startswith("overflowTokens="):
+                cat["overflow_tokens"] = _parse_int_field(part)
         return cat
 
     if "auto-compaction" in ml:
@@ -479,9 +491,16 @@ def analyze(entries, since=None):
 
             elif etype == "context_overflow":
                 result["context"]["overflows"] += 1
+                _oc_msgs = cat.get('msg_count')
+                _oc_msg_str = _oc_msgs if _oc_msgs is not None else 'n/a'
+                _oc_extra = ''
+                if cat.get('est_prompt_tokens') is not None:
+                    _oc_extra += f" est={cat['est_prompt_tokens']}"
+                if cat.get('overflow_tokens') is not None:
+                    _oc_extra += f" over={cat['overflow_tokens']}"
                 result["raw_events"].append({
                     "source": "openclaw", "time": ts_str, "type": "📦 上下文溢出",
-                    "detail": f"subtype={cat.get('subtype','?')} msgs={cat.get('msg_count','?')}",
+                    "detail": f"subtype={cat.get('subtype','?')} msgs={_oc_msg_str}{_oc_extra}",
                     "level": "WARN"
                 })
 
