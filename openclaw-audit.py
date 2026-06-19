@@ -21,7 +21,7 @@ Environment Variables:
   OPENCLAW_CLI        OpenClaw CLI 路径 (default: openclaw)
 """
 
-import json, sys, os, sqlite3, glob, time, argparse, re
+import json, sys, os, sqlite3, glob, time, argparse, re, shutil
 from datetime import datetime, timedelta, timezone
 from collections import Counter, defaultdict
 
@@ -631,10 +631,48 @@ def analyze(entries, since=None):
 def _resolve_node_cli():
     """Resolve node and openclaw CLI paths.
     
-    Priority: env vars > common install paths > PATH lookup.
+    Priority: explicit env vars > PATH lookup > common absolute fallbacks.
     """
-    node = os.environ.get("OPENCLAW_NODE") or "node"
-    cli = os.environ.get("OPENCLAW_CLI") or "openclaw"
+    node = os.environ.get("OPENCLAW_NODE")
+    cli = os.environ.get("OPENCLAW_CLI")
+
+    if not node:
+        node = shutil.which("node")
+    if not cli:
+        cli = shutil.which("openclaw")
+
+    if not node:
+        for candidate in [
+            "/opt/homebrew/bin/node",
+            "/opt/homebrew/Cellar/node@22/22.22.3/bin/node",
+            "/usr/local/bin/node",
+        ]:
+            if os.path.exists(candidate):
+                node = candidate
+                break
+
+    if not cli:
+        for candidate in [
+            "/opt/homebrew/bin/openclaw",
+            "/usr/local/bin/openclaw",
+        ]:
+            if os.path.exists(candidate):
+                cli = candidate
+                break
+
+    # Fallback: if openclaw CLI is not found, use the .mjs directly
+    if not cli or not os.path.exists(cli):
+        for candidate in [
+            os.path.expanduser("~/.openclaw/node_modules/openclaw/openclaw.mjs"),
+            "/opt/homebrew/lib/node_modules/openclaw/openclaw.mjs",
+            "/usr/local/lib/node_modules/openclaw/openclaw.mjs",
+        ]:
+            if os.path.exists(candidate):
+                cli = candidate
+                break
+
+    node = node or "node"
+    cli = cli or "openclaw"
     return node, cli
 
 
@@ -647,10 +685,20 @@ def query_sessions():
         home = os.path.expanduser("~")
         env = os.environ.copy()
         env["HOME"] = home
-        env["PATH"] = os.path.dirname(node) + ":" + os.path.dirname(cli) + ":" + env.get("PATH", "/usr/bin:/bin")
+
+        # Determine command: if cli ends with .mjs, run as node script; otherwise use as CLI
+        if cli.endswith(".mjs") or cli.endswith(".js"):
+            cmd = [node, cli, "sessions", "--json", "--active", "1440"]
+            cmd_env = env
+        else:
+            cli_dir = os.path.dirname(cli)
+            if cli_dir:
+                env["PATH"] = cli_dir + ":" + env.get("PATH", "/usr/bin:/bin")
+            cmd = [cli, "sessions", "--json", "--active", "1440"]
+            cmd_env = env
+
         result = subprocess.run(
-            [node, cli, "sessions", "--json", "--active", "1440"],
-            capture_output=True, text=True, timeout=15, env=env
+            cmd, capture_output=True, text=True, timeout=15, env=cmd_env
         )
         if result.returncode != 0:
             sessions_info["error"] = f"exit={result.returncode} stderr={result.stderr[:200]}"
@@ -674,6 +722,7 @@ def query_sessions():
                 "contextTokens": ctx,
                 "usagePct": pct,
                 "hasTokens": has_tokens,
+                "isFailed": total is None and s.get("kind") == "spawn-child",
                 "key": s.get("key", "")[-50:],
                 "sessionId": s.get("sessionId", ""),
                 "updatedAt": s.get("updatedAt"),
@@ -851,11 +900,15 @@ def print_report(result, sqlite_info, sessions_info=None):
         for sess in sessions_info["active"]:
             pct = sess.get("usagePct")
             has_tokens = sess.get("hasTokens", False)
+            status = sess.get("status", "unknown")
             kind = sess["kind"]
             model = sess["model"]
             updated_display = sess.get("clientUpdatedAt", "")
             timestamp_tag = f" {DIM(chr(64) + updated_display)}" if updated_display else ""
-            if not has_tokens:
+            # 失败会话优先标记
+            if sess.get("isFailed"):
+                print(f"     [{kind:8}] {RED('❌ FAILED')} {'—'} {sess.get('totalTokens', '?')}/{sess['contextTokens']:,} {model}{timestamp_tag}")
+            elif not has_tokens:
                 print(f"     [{kind:8}] {'N/A':>5} {'—'} {sess.get('totalTokens', '?')}/{sess['contextTokens']:,} {model}{timestamp_tag}")
             else:
                 pct_val = pct or 0
@@ -1132,18 +1185,26 @@ def web_mode(args):
   {% for sess in data.sessions.active %}
     {% set has_tok = sess.get('hasTokens', False) %}
     {% set pct = sess.usagePct %}
-    {% if has_tok %}
+    {% set sess_failed = sess.get('isFailed', False) %}
+    {% if sess_failed %}
+      {% set cls = 'bad' %}
+    {% elif has_tok %}
       {% if pct < 50 %}{% set cls = 'good' %}{% elif pct < 80 %}{% set cls = 'warn' %}{% else %}{% set cls = 'bad' %}{% endif %}
     {% else %}
       {% set cls = '' %}
     {% endif %}
     <div class="card">
       <div class="label">{{ sess.kind }} ({{ sess.model }}) <span style="color:#565f89;font-weight:normal">@{{ sess.clientUpdatedAt if sess.clientUpdatedAt else '??' }}</span></div>
-      <div class="value {{ cls }}">{% if has_tok %}{{ '%.0f'|format(pct) }}%{% else %}N/A{% endif %}</div>
-      <div class="sublabel">{% if has_tok %}{{ '{:,}'.format(sess.totalTokens) }}/{{ '{:,}'.format(sess.contextTokens) }}{% else %}N/A/{% endif %}</div>
+      <div class="value {{ cls }}">{% if sess_failed %}FAILED{% elif has_tok %}{{ '%.0f'|format(pct) }}%{% else %}N/A{% endif %}</div>
+      <div class="sublabel">{% if sess_failed %}❌ 子会话已失败{% elif has_tok %}{{ '{:,}'.format(sess.totalTokens) }}/{{ '{:,}'.format(sess.contextTokens) }}{% else %}N/A/{% endif %}</div>
     </div>
   {% endfor %}
-  {% if not data.sessions.active %}
+  {% if data.sessions.error %}
+    <div class="card">
+      <div class="label">Session 查询失败</div>
+      <div class="value bad" style="font-size:1em">{{ data.sessions.error }}</div>
+    </div>
+  {% elif not data.sessions.active %}
     <div class="card"><div class="value" style="font-size:1em">暂无会话数据</div></div>
   {% endif %}
   </div>
