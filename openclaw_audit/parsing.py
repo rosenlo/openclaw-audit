@@ -6,7 +6,7 @@ import os
 import re
 import sys
 from collections import Counter
-from datetime import datetime
+from datetime import datetime, timedelta as _td
 
 from .config import LOG_DIR, LITELLM_ERR_LOG, LITELLM_OUT_LOG, now_local
 from .util import parse_ts
@@ -63,8 +63,58 @@ def parse_openclaw_logs_since(since=None):
 
 
 # ─── LiteLLM 日志解析 ──────────────────────────────────────────────
+# LiteLLM 写 err.log 有两种格式，由它进程内的 _logging.py 决定：
+#   1) 默认文本：`HH:MM:SS - LiteLLM Router:ERROR: file.py:97 - ...`
+#      datefmt="%H:%M:%S" 是写死的，config.yaml 没暴露，所以没有日期。
+#   2) JSON（设 JSON_LOGS=true 启用 JsonFormatter）：每行一个 JSON 对象，
+#      timestamp = datetime.fromtimestamp(record.created).isoformat()，
+#      带完整日期年份，是根治“只有时分秒需要推断”的来源。
+# 优先按 JSON 解析；失败再回退文本格式。文本格式仍保留跨午夜推断，但
+# 加阈值，避免同日内日志乱序被误判成跨天。
+ansi_pat = re.compile(r"\033\[[0-9;]*m")
+text_line_pat = re.compile(
+    r"^(\d{2}:\d{2}:\d{2})\s*-\s*LiteLLM\s+(\S+):(\S+):\s+(.*)$"
+)
+# 同日内日志乱序（多 worker / 缓冲刷新 / 同秒多条）导致的时间倒退幅度一般
+# 在几分钟以内；真正的跨午夜倒退是从深夜回到凌晨，幅度巨大（>12h）。
+# 用 12 小时作为阈值：倒退超过 12h 才认为是跨了午夜，否则视为同日乱序，
+# 保持当天日期不再 +1。这样 22:25 -> 22:22 这种不会被标成明天。
+_MIDNIGHT_BACKSTEP_THRESHOLD_SECONDS = 12 * 3600
+
+
+def _backstep_seconds(prev_hms, cur_hms):
+    """Seconds from cur_hms back to prev_hms, assuming same day. cur < prev."""
+    base = datetime(2000, 1, 1)
+    a = base.replace(hour=prev_hms.hour, minute=prev_hms.minute, second=prev_hms.second)
+    b = base.replace(hour=cur_hms.hour, minute=cur_hms.minute, second=cur_hms.second)
+    return (a - b).total_seconds()
+
+
+def _litellm_json_entry(obj, since_ts):
+    """Build a (source, full_ts, level, msg) tuple from a JSON log line, or
+    None when the line isn't a usable LiteLLM JSON record."""
+    if not isinstance(obj, dict):
+        return None
+    ts_str = obj.get("timestamp")
+    msg = obj.get("message")
+    if not ts_str or not msg:
+        return None
+    parsed = parse_ts(ts_str)
+    if parsed is None:
+        return None
+    if since_ts is not None and parsed.timestamp() < since_ts:
+        return None
+    level = obj.get("level", "INFO")
+    component = obj.get("component", "LiteLLM")
+    logger = obj.get("logger")  # "filename:lineno"
+    detail = f"[{component}] {logger} - {msg}" if logger else f"[{component}] {msg}"
+    full_ts = parsed.strftime("%Y-%m-%dT%H:%M:%S") + "+07:00"
+    return ("litellm", full_ts, level, detail)
+
+
 def parse_litellm_err_log(since=None):
-    """Parse litellm.err.log: lines have prefix like 09:11:20 - LiteLLM Router:ERROR: ..."""
+    """Parse litellm.err.log. Supports JSON logs (JSON_LOGS=true, preferred)
+    and the legacy `HH:MM:SS - LiteLLM ...:` text format."""
     entries = []
     if not os.path.exists(LITELLM_ERR_LOG):
         return entries
@@ -73,25 +123,31 @@ def parse_litellm_err_log(since=None):
     if since:
         since_ts = since.timestamp()
 
-    # litellm err lines carry only HH:MM:SS, no date. Infer the date by
-    # walking forward through the file: when the time-of-day wraps
-    # backwards relative to the previous emitted line, the log has crossed
-    # midnight, so advance the date cursor by one day. Seed with TODAY so a
-    # same-day log still resolves correctly. This keeps cross-source sort
-    # order honest instead of stamping every line with the module-load date.
+    # 文本格式的日期推断游标：只有 HH:MM:SS 时按行序走，跨午夜才 +1 天。
     cur_date = now_local().date()
     prev_hms = None
-
-    ansi_pat = re.compile(r"\033\[[0-9;]*m")
-    line_pat = re.compile(
-        r"^(\d{2}:\d{2}:\d{2})\s*-\s*LiteLLM\s+(\S+):(\S+):\s+(.*)$"
-    )
 
     try:
         with open(LITELLM_ERR_LOG) as f:
             for line in f:
                 clean = ansi_pat.sub("", line).strip()
-                m = line_pat.match(clean)
+                if not clean:
+                    continue
+
+                # 优先 JSON（JSON_LOGS=true 输出）。
+                if clean.startswith("{"):
+                    try:
+                        obj = json.loads(clean)
+                    except json.JSONDecodeError:
+                        obj = None
+                    if obj is not None:
+                        ent = _litellm_json_entry(obj, since_ts)
+                        if ent is not None:
+                            entries.append(ent)
+                        continue
+
+                # 回退到文本格式。
+                m = text_line_pat.match(clean)
                 if m:
                     ts_str = m.group(1)
                     component = m.group(2)
@@ -103,9 +159,15 @@ def parse_litellm_err_log(since=None):
                         continue
 
                     cur_hms = parsed.time() if parsed else None
-                    if prev_hms is not None and cur_hms is not None and cur_hms < prev_hms:
-                        # Time went backwards -> crossed midnight in the log file.
-                        from datetime import timedelta as _td
+                    if (
+                        prev_hms is not None
+                        and cur_hms is not None
+                        and cur_hms < prev_hms
+                        and _backstep_seconds(prev_hms, cur_hms)
+                        >= _MIDNIGHT_BACKSTEP_THRESHOLD_SECONDS
+                    ):
+                        # 倒退幅度足够大才算真的跨了午夜；小幅倒退是同日
+                        # 乱序，保持当天日期，避免把 22:22 标成明天。
                         cur_date = cur_date + _td(days=1)
                     prev_hms = cur_hms
 

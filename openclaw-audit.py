@@ -19,6 +19,11 @@ Environment Variables:
   OPENCLAW_AUDIT_TZ   时区偏移 (default: +07:00, 或 UTC)
   OPENCLAW_NODE       Node.js 可执行路径 (default: node)
   OPENCLAW_CLI        OpenClaw CLI 路径 (default: openclaw)
+
+LiteLLM 日志格式:
+  推荐 LiteLLM 进程设 JSON_LOGS=true，让 err.log 每行一个 JSON 对象、
+  timestamp 带完整日期年份 (LITELLM_LOG=DEBUG 控制级别)。本工具同时兼容
+  老的 HH:MM:SS 文本格式。注意是 JSON_LOGS，不是 LITELLM_LOG=JSON。
 """
 
 import argparse
