@@ -10,7 +10,7 @@ This repo is a small, mostly self-contained audit tool for local OpenClaw setups
 - Keep machine-specific paths behind environment variables.
 - Prefer standard-library Python unless an added dependency is clearly worth it.
 - Treat Flask as optional for the dashboard path.
-- Avoid breaking the single-file CLI unless there is a strong reason to split modules.
+- Logic lives in the `openclaw_audit/` package; `openclaw-audit.py` is a thin CLI/web/watch wrapper. Add new logic to the package, keep the module dependency DAG cycle-free, and update `openclaw_audit/__init__.py` (its public exports are locked by a test) when the surface changes.
 
 ## When Editing
 
