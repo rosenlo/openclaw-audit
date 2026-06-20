@@ -155,7 +155,7 @@ def print_report(result, sqlite_info, sessions_info=None):
         limit = 100
         for ev in events[:limit]:
             pt = parse_ts(ev["time"])
-            ts_display = pt.strftime("%H:%M:%S") if pt else (ev["time"][:16] if ev["time"] else "??")
+            ts_display = pt.strftime("%Y-%m-%d %H:%M:%S") if pt else (ev["time"][:19].replace("T", " ") if ev["time"] else "??")
             src = ev.get("source", "?")
             if src == "litellm":
                 src_tag = DIM("[L]")
@@ -408,7 +408,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
     {% if ev.level == 'ERROR' %}{% set tag_class = 'tag-error' %}
     {% elif ev.level == 'WARN' %}{% set tag_class = 'tag-warn' %}{% endif %}
     <div class="event">
-      <span class="ts">{{ ev.time[:16] if ev.time else '??' }}</span>
+      <span class="ts">{{ ev.time[:19].replace("T", " ") if ev.time else '??' }}</span>
       <span class="tag {{ tag_class }}">{{ ev.type }}</span>
       <span class="detail">{{ ev.detail[:150] }}</span>
     </div>

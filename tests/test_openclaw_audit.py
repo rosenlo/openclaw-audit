@@ -209,3 +209,28 @@ def test_litellm_err_log_same_day_no_spurious_advance():
 
     dates = {e[1].split("T")[0] for e in entries}
     assert len(dates) == 1, f"all same-day lines should share one date, got {dates}"
+
+
+def test_cli_event_list_shows_full_date_with_year(capsys):
+    """Event timestamps in the CLI list must include the date (with year),
+    not just HH:MM:SS. Guards against a regression where cross-day events
+    became ambiguous. litellm err lines now carry an inferred date too."""
+    from datetime import datetime
+    from openclaw_audit import analyze, print_report
+
+    # A litellm auth event with a real ISO timestamp (date + time + tz).
+    entries = [
+        ("litellm", "2026-06-20T22:25:57+07:00", "ERROR",
+         "[Proxy] auth_exception_handler.py:97 - litellm.proxy.proxy_server."
+         "user_api_key_auth(): Exception occured - No api key passed"),
+    ]
+    result = analyze(entries)
+    print_report(result, sqlite_info={}, sessions_info=None)
+    out = capsys.readouterr().out
+
+    # The event row must render the full date incl. year, not bare HH:MM:SS.
+    assert "2026-06-20 22:25:57" in out
+    # And the auth root-cause text must frame it as a /models probe (A-plan
+    # noise reduction), not a credential emergency.
+    assert "/models" in out
+    assert "不影响" in out
