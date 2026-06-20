@@ -18,6 +18,17 @@ def classify_litellm_entry(msg):
     if "fallback also failed" in ml:
         cat["type"] = "upstream_fallback_failed"
         return cat
+    # Auth failures carry "Exception occured" too (auth_exception_handler /
+    # user_api_key_auth / "No api key passed"), so detect them BEFORE the
+    # generic proxy_exception bucket or they get mislabeled as a runtime
+    # proxy error and mislead triage.
+    if (
+        "no api key passed" in ml
+        or "auth_exception_handler" in ml
+        or "user_api_key_auth" in ml
+    ):
+        cat["type"] = "auth_error"
+        return cat
     if "exception occured" in ml:
         cat["type"] = "proxy_exception"
         return cat

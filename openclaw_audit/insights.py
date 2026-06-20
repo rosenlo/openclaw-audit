@@ -9,7 +9,7 @@ of truth for recommendations and root-cause language.
 def build_suggestions(result, tg_result=None):
     """Build the suggestion list from the current audit result."""
     s = result["summary"]
-    l = result["litellm"]
+    l = result.get("litellm", {})
     tg_result = tg_result or result.get("telegram", {})
 
     suggestions = []
@@ -17,9 +17,11 @@ def build_suggestions(result, tg_result=None):
         suggestions.append("🟡 任务卡住但未必断连 — 检查 stalled_agent_run / active_work_without_progress")
     if s["llm_aborts"] > 0:
         suggestions.append("🟡 LLM 请求被 abort / failover — 优先看上游链路而不是 Telegram")
-    if l["proxy_exceptions"] > 0:
+    if l.get("auth_errors", 0) > 0:
+        suggestions.append("🔴 LiteLLM 鉴权失败 — 检查 API key 配置 / virtual key 是否过期或缺失")
+    if l.get("proxy_exceptions", 0) > 0:
         suggestions.append("🔴 LiteLLM 代理异常 — 先查 LitellM / proxy 日志")
-    if l["upstream_timeouts"] > 0:
+    if l.get("upstream_timeouts", 0) > 0:
         suggestions.append("🔴 LiteLLM 上游超时 — 上游响应慢或超时")
     if s["llm_timeouts"] >= 3:
         suggestions.append("🔴 LLM 频繁超时 — 检查 litellm upstream 响应速度, 或降低 litellm 的 request_timeout 配置")
@@ -33,7 +35,7 @@ def build_suggestions(result, tg_result=None):
         suggestions.append("🟡 Edit工具失败过多 — 长文本编辑建议用 Write 替代 Edit")
     if tg_result.get("errors", 0) > 0:
         suggestions.append("🔴 Telegram 回复失败 — 需关注消息发送链路")
-    if l["warnings"] > 0:
+    if l.get("warnings", 0) > 0:
         suggestions.append("🟡 Litellm 配置警告 — 将 set_verbose 改为 LITELLM_LOG=DEBUG")
     if not suggestions:
         suggestions.append("✅ 系统运行正常")
@@ -43,17 +45,19 @@ def build_suggestions(result, tg_result=None):
 def build_root_cause_summary(result):
     """Build a short root-cause summary for the current time window."""
     s = result["summary"]
-    l = result["litellm"]
+    l = result.get("litellm", {})
 
     ranked = []
     if s["session_stalls"] > 0:
         ranked.append(("任务执行卡住", s["session_stalls"], "active_work_without_progress / stalled_agent_run"))
     if s["llm_aborts"] > 0:
         ranked.append(("LLM 请求中断", s["llm_aborts"], "AbortError / failover"))
-    if l["proxy_exceptions"] > 0:
-        ranked.append(("LiteLLM 代理异常", l["proxy_exceptions"], "proxy / auth / internal exception"))
-    if l["upstream_timeouts"] > 0:
-        ranked.append(("LiteLLM 上游超时", l["upstream_timeouts"], "upstream timeout"))
+    if l.get("auth_errors", 0) > 0:
+        ranked.append(("LiteLLM 鉴权失败", l.get("auth_errors", 0), "No api key passed / virtual key 缺失"))
+    if l.get("proxy_exceptions", 0) > 0:
+        ranked.append(("LiteLLM 代理异常", l.get("proxy_exceptions", 0), "proxy / internal exception"))
+    if l.get("upstream_timeouts", 0) > 0:
+        ranked.append(("LiteLLM 上游超时", l.get("upstream_timeouts", 0), "upstream timeout"))
     if s["context_overflows"] > 0:
         ranked.append(("上下文溢出", s["context_overflows"], "context overflow / compaction"))
     if s["connection_issues"] > 0:
@@ -75,6 +79,12 @@ def build_root_cause_summary(result):
         return (
             f"主要问题是 LLM 请求中断，共 {top_count} 次。"
             f"这通常指向 {top_hint}，优先排查上游模型调用而不是 Telegram。"
+        )
+    if top_name == "LiteLLM 鉴权失败":
+        return (
+            f"主要问题是 LiteLLM 鉴权失败，共 {top_count} 次。"
+            f"请求没带有效 API key（No api key passed），属于配置/凭证问题，"
+            f"不是上游模型或 Telegram 链路问题。优先检查 virtual key 是否过期或缺失。"
         )
     if top_name == "LiteLLM 代理异常":
         return (

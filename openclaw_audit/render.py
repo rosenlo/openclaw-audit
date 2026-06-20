@@ -79,6 +79,7 @@ def print_report(result, sqlite_info, sessions_info=None):
     print(f"     ├─ 上游连接错误:          {RED(str(l['upstream_connections'])) if l['upstream_connections'] else GREEN('0')} 次")
     print(f"     ├─ Fallback失败:          {RED(str(l['fallback_failures'])) if l['fallback_failures'] else GREEN('0')} 次")
     print(f"     ├─ 代理异常:              {RED(str(l['proxy_exceptions'])) if l['proxy_exceptions'] else GREEN('0')} 次")
+    print(f"     ├─ 鉴权失败:              {RED(str(l['auth_errors'])) if l['auth_errors'] else GREEN('0')} 次")
     print(f"     └─ 上游错误总数:          {RED(str(l['upstream_errors'])) if l['upstream_errors'] else GREEN('0')} 次")
 
     if l["warnings"]:
@@ -160,7 +161,7 @@ def print_report(result, sqlite_info, sessions_info=None):
                 src_tag = DIM("[L]")
             else:
                 src_tag = ""
-            detail = ev.get("detail", "")[:100]
+            detail = ev.get("detail", "")[:200]
             level = ev.get("level", "")
             prefix = RED("✗") if level == "ERROR" else (YELLOW("!") if level == "WARN" else "·")
             print(f"     {prefix} {DIM(ts_display)} {src_tag} {ev['type']}")
@@ -307,6 +308,11 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
     <div class="card">
       <div class="label">上游连接错误</div>
       <div class="value {% if data.litellm.upstream_errors > 0 %}bad{% else %}good{% endif %}">{{ data.litellm.upstream_errors }}</div>
+    </div>
+    <div class="card">
+      <div class="label">鉴权失败</div>
+      <div class="value {% if data.litellm.auth_errors > 0 %}bad{% else %}good{% endif %}">{{ data.litellm.auth_errors }}</div>
+      <div class="sublabel">no api key passed</div>
     </div>
     <div class="card">
       <div class="label">状态码</div>

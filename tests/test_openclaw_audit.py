@@ -98,3 +98,114 @@ def test_package_exports_public_api():
         "HTML_TEMPLATE", "now_local",
     ]:
         assert hasattr(openclaw_audit, name), f"openclaw_audit missing {name}"
+
+
+# ─── litellm auth classification + ordering + truncation ──────────────
+AUTH_MSG = (
+    "[Proxy] auth_exception_handler.py:97 - "
+    "litellm.proxy.proxy_server.user_api_key_auth(): Exception occured - "
+    "No api key passed"
+)
+
+
+def test_classify_litellm_auth_error_beats_proxy_exception():
+    """The auth message contains 'Exception occured', so it would normally
+    bucket as proxy_exception. Auth must win so triage points at credentials,
+    not a runtime proxy fault."""
+    from openclaw_audit import classify_litellm_entry
+
+    cat = classify_litellm_entry(AUTH_MSG)
+    assert cat["type"] == "auth_error"
+
+
+def test_classify_litellm_generic_exception_still_proxy():
+    """A non-auth 'Exception occured' line must still classify as
+    proxy_exception — the auth branch must not over-match."""
+    from openclaw_audit import classify_litellm_entry
+
+    cat = classify_litellm_entry("[Router] Exception occured - something else")
+    assert cat["type"] == "proxy_exception"
+
+
+def test_analyze_counts_auth_and_label():
+    from openclaw_audit import analyze
+
+    entries = [
+        ("litellm", "2026-06-20T22:25:03+07:00", "ERROR", AUTH_MSG),
+    ]
+    result = analyze(entries)
+
+    assert result["litellm"]["auth_errors"] == 1
+    assert result["litellm"]["proxy_exceptions"] == 0
+    assert result["summary"]["litellm_auth_errors"] == 1
+    ev = result["raw_events"][0]
+    assert ev["type"] == "🔑 Litellm鉴权失败"
+    assert ev["level"] == "ERROR"
+
+
+def test_analyze_detail_not_truncated_short():
+    """The auth detail was previously cut at 'No api key pa'. With the
+    200-char limit the full 'No api key passed' must survive into the
+    stored detail."""
+    from openclaw_audit import analyze
+
+    entries = [("litellm", "2026-06-20T22:25:03+07:00", "ERROR", AUTH_MSG)]
+    result = analyze(entries)
+    detail = result["raw_events"][0]["detail"]
+    assert "No api key passed" in detail
+    assert not detail.endswith("No api key pa")
+
+
+def test_litellm_err_log_date_inference_across_midnight():
+    """litellm err lines have only HH:MM:SS. When the time wraps backwards
+    the parser must advance the inferred date by one day, so a 23:59 -> 00:01
+    sequence is stamped on consecutive days (not both on 'today')."""
+    import tempfile, os
+    from openclaw_audit import parsing
+
+    lines = [
+        "23:59:58 - LiteLLM Router:ERROR: late-night error\n",
+        "00:01:05 - LiteLLM Router:ERROR: after-midnight error\n",
+    ]
+    with tempfile.NamedTemporaryFile("w", suffix=".log", delete=False) as tf:
+        tf.writelines(lines)
+        path = tf.name
+    try:
+        orig = parsing.LITELLM_ERR_LOG
+        parsing.LITELLM_ERR_LOG = path
+        entries = parsing.parse_litellm_err_log(since=None)
+    finally:
+        parsing.LITELLM_ERR_LOG = orig
+        os.unlink(path)
+
+    assert len(entries) == 2
+    d1 = entries[0][1].split("T")[0]
+    d2 = entries[1][1].split("T")[0]
+    # second line is the next calendar day relative to the first
+    assert d2 > d1, f"expected date to advance across midnight: {d1} -> {d2}"
+
+
+def test_litellm_err_log_same_day_no_spurious_advance():
+    """A normal increasing-time sequence within one day must NOT advance the
+    date — guards against the cursor over-rotating on same-day logs."""
+    import tempfile, os
+    from openclaw_audit import parsing
+
+    lines = [
+        "10:00:00 - LiteLLM Router:ERROR: first\n",
+        "10:05:00 - LiteLLM Router:ERROR: second\n",
+        "10:10:00 - LiteLLM Router:ERROR: third\n",
+    ]
+    with tempfile.NamedTemporaryFile("w", suffix=".log", delete=False) as tf:
+        tf.writelines(lines)
+        path = tf.name
+    try:
+        orig = parsing.LITELLM_ERR_LOG
+        parsing.LITELLM_ERR_LOG = path
+        entries = parsing.parse_litellm_err_log(since=None)
+    finally:
+        parsing.LITELLM_ERR_LOG = orig
+        os.unlink(path)
+
+    dates = {e[1].split("T")[0] for e in entries}
+    assert len(dates) == 1, f"all same-day lines should share one date, got {dates}"

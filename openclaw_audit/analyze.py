@@ -29,6 +29,7 @@ def analyze(entries, since=None):
             "upstream_connections": 0,
             "fallback_failures": 0,
             "proxy_exceptions": 0,
+            "auth_errors": 0,
             "general_errors": 0,
             "warnings": 0,
         },
@@ -59,7 +60,7 @@ def analyze(entries, since=None):
                 tag_emoji = "📩"
                 result["raw_events"].append({
                     "source": "openclaw", "time": ts_str, "type": "📩 Telegram消息",
-                    "detail": msg[:120], "level": level
+                    "detail": msg[:200], "level": level
                 })
 
             elif etype == "telegram_out":
@@ -132,7 +133,7 @@ def analyze(entries, since=None):
                 result["failovers"] += 1
                 result["raw_events"].append({
                     "source": "openclaw", "time": ts_str, "type": "🔄 Failover",
-                    "detail": msg[:100], "level": "WARN"
+                    "detail": msg[:200], "level": "WARN"
                 })
 
             elif etype == "incomplete_turn":
@@ -146,21 +147,21 @@ def analyze(entries, since=None):
                 result["connection_issues"] += 1
                 result["raw_events"].append({
                     "source": "openclaw", "time": ts_str, "type": "🔌 Telegram断连",
-                    "detail": msg[:100], "level": "WARN"
+                    "detail": msg[:200], "level": "WARN"
                 })
 
             elif etype == "config_reload":
                 result["config_reloads"] += 1
                 result["raw_events"].append({
                     "source": "openclaw", "time": ts_str, "type": "⚙️ 配置热加载",
-                    "detail": msg[:120], "level": "INFO"
+                    "detail": msg[:200], "level": "INFO"
                 })
 
             elif etype == "edit_failed":
                 result["tool_errors"]["edit"] += 1
                 result["raw_events"].append({
                     "source": "openclaw", "time": ts_str, "type": "✏️ Edit失败",
-                    "detail": msg[:120], "level": "WARN"
+                    "detail": msg[:200], "level": "WARN"
                 })
 
             elif etype == "read_failed":
@@ -169,15 +170,15 @@ def analyze(entries, since=None):
             elif etype in ("lane_error", "fetch_timeout", "agent_end"):
                 result["raw_events"].append({
                     "source": "openclaw", "time": ts_str, "type": f"⚠️ {cat.get('type','?')}",
-                    "detail": msg[:120],
+                    "detail": msg[:200],
                     "level": "WARN" if etype != "agent_end" else "INFO"
                 })
 
             elif etype == "unknown_error":
-                result["other_errors"].append(msg[:150])
+                result["other_errors"].append(msg[:200])
                 result["raw_events"].append({
                     "source": "openclaw", "time": ts_str, "type": f"❌ {level}",
-                    "detail": msg[:150], "level": level
+                    "detail": msg[:200], "level": level
                 })
 
         # ── LiteLLM events ──
@@ -190,7 +191,7 @@ def analyze(entries, since=None):
                 litellm_err_counts["upstream_timeout"] += 1
                 result["raw_events"].append({
                     "source": "litellm", "time": ts_str, "type": "⏰ Litellm上游超时",
-                    "detail": msg[:120], "level": "ERROR"
+                    "detail": msg[:200], "level": "ERROR"
                 })
 
             elif etype == "upstream_connection":
@@ -199,7 +200,7 @@ def analyze(entries, since=None):
                 litellm_err_counts["upstream_connection"] += 1
                 result["raw_events"].append({
                     "source": "litellm", "time": ts_str, "type": "🔌 Litellm连接错误",
-                    "detail": msg[:120], "level": "ERROR"
+                    "detail": msg[:200], "level": "ERROR"
                 })
 
             elif etype == "upstream_fallback_failed":
@@ -208,7 +209,15 @@ def analyze(entries, since=None):
                 litellm_err_counts["fallback_failed"] += 1
                 result["raw_events"].append({
                     "source": "litellm", "time": ts_str, "type": "❌ Litellm Fallback失败",
-                    "detail": msg[:120], "level": "ERROR"
+                    "detail": msg[:200], "level": "ERROR"
+                })
+
+            elif etype == "auth_error":
+                result["litellm"]["auth_errors"] += 1
+                litellm_err_counts["auth_error"] += 1
+                result["raw_events"].append({
+                    "source": "litellm", "time": ts_str, "type": "🔑 Litellm鉴权失败",
+                    "detail": msg[:200], "level": "ERROR"
                 })
 
             elif etype == "proxy_exception":
@@ -217,7 +226,7 @@ def analyze(entries, since=None):
                 litellm_err_counts["proxy_exception"] += 1
                 result["raw_events"].append({
                     "source": "litellm", "time": ts_str, "type": "❌ Litellm代理异常",
-                    "detail": msg[:120], "level": "ERROR"
+                    "detail": msg[:200], "level": "ERROR"
                 })
 
             elif etype == "deprecation_warning":
@@ -257,6 +266,7 @@ def analyze(entries, since=None):
         "litellm_upstream_connections": result["litellm"]["upstream_connections"],
         "litellm_fallback_failures": result["litellm"]["fallback_failures"],
         "litellm_proxy_exceptions": result["litellm"]["proxy_exceptions"],
+        "litellm_auth_errors": result["litellm"]["auth_errors"],
         "litellm_general_errors": result["litellm"]["general_errors"],
     }
 
