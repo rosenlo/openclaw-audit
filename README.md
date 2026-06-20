@@ -18,7 +18,7 @@ Audit the Telegram -> OpenClaw -> LiteLLM request path from local logs.
 
 ## Requirements
 
-- Python 3.9+
+- Python 3.11+
 - Flask only if you want `--web`
 - A local OpenClaw install and readable logs
 
