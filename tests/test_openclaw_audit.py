@@ -380,3 +380,115 @@ def test_litellm_text_real_midnight_still_advances():
     d1 = entries[0][1].split("T")[0]
     d2 = entries[1][1].split("T")[0]
     assert d2 > d1, f"expected date to advance across midnight: {d1} -> {d2}"
+
+
+# ─── OpenClaw level path + new event types ───────────────────────────
+# Fixtures use the real field shape captured from the live log on
+# 172.27.15.62: logLevelName lives under _meta (the top-level field is
+# absent), and message/time are top-level. Built with json.dumps so the
+# nested-escaping matches what the process actually writes.
+
+
+def _openclaw_line(message, level, time_iso):
+    import json as _json
+    d = {
+        "0": "{\"subsystem\":\"telegram/send\"}",
+        "1": message,
+        "_meta": {
+            "logLevelName": level,
+            "name": "{\"subsystem\":\"telegram/send\"}",
+            "date": "2026-06-20T16:51:48.689Z",
+            "path": {"fileName": "subsystem-BbA2Znit.js"},
+        },
+        "time": time_iso,
+        "message": message,
+        "traceId": "b877dabd816b6d6b60d121f2f5b62a8c",
+    }
+    return _json.dumps(d, ensure_ascii=False) + chr(10)
+
+
+def test_openclaw_level_read_from_meta():
+    """Real OpenClaw logs carry logLevelName under _meta, not at the top
+    level. The parser must look there too, or every line's level comes back
+    empty and all WARN/ERROR events get dropped as 'other'."""
+    from openclaw_audit import parsing
+    line = _openclaw_line(
+        "failed to mirror outbound delivery into session transcript; "
+        "channel send already succeeded: session file changed while embedded "
+        "prompt lock was released: /Users/rosen/.openclaw/agents/main/sessions/x.jsonl",
+        "WARN",
+        "2026-06-20T23:51:48.706+07:00",
+    )
+    path = _write_tmp_log([line])
+    try:
+        orig = parsing.LOG_DIR
+        # parse_openclaw_log takes an explicit filepath, so call it directly.
+        entries = parsing.parse_openclaw_log(path)
+    finally:
+        import os; os.unlink(path)
+
+    assert len(entries) == 1
+    _src, _ts, level, _msg = entries[0]
+    assert level == "WARN", f"level must be read from _meta.logLevelName, got {level!r}"
+
+
+def test_transcript_mirror_failed_classified_and_counted():
+    """The 'failed to mirror ... session transcript' WARN must get its own
+    category, count, and event entry instead of being buried as generic WARN."""
+    from openclaw_audit import analyze, classify_entry
+    msg = (
+        "failed to mirror outbound delivery into session transcript; "
+        "channel send already succeeded: session file changed while embedded "
+        "prompt lock was released: /Users/rosen/.openclaw/agents/main/sessions/x.jsonl"
+    )
+    cat = classify_entry(msg, "WARN")
+    assert cat["type"] == "transcript_mirror_failed"
+
+    entries = [("openclaw", "2026-06-20T23:51:48.706+07:00", "WARN", msg)]
+    result = analyze(entries)
+    assert result["transcript_mirror_failures"] == 1
+    assert result["summary"]["transcript_mirror_failures"] == 1
+    ev = result["raw_events"][0]
+    assert ev["type"] == "📝 会话记录缺失"
+    assert ev["level"] == "WARN"
+
+
+def test_telegram_send_ok_classified_not_double_counted():
+    """'telegram outbound send ok' is the high-frequency delivery line. It
+    must get its own type and show in events, but NOT increment
+    telegram.outbound (that path is the legacy 'message processed' line;
+    counting both would double-count until co-occurrence is ruled out)."""
+    from openclaw_audit import analyze, classify_entry
+    msg = (
+        "telegram outbound send ok accountId=default chatId=670530854 "
+        "messageId=1955 operation=sendRichMessage deliveryKind=text chunkCount=1"
+    )
+    cat = classify_entry(msg, "INFO")
+    assert cat["type"] == "telegram_send_ok"
+    assert cat["message_id"] == "1955"
+    assert cat["chat_id"] == "670530854"
+
+    entries = [("openclaw", "2026-06-20T23:51:48.689+07:00", "INFO", msg)]
+    result = analyze(entries)
+    assert result["telegram"]["send_ok"] == 1
+    # outbound must NOT include send_ok
+    assert result["telegram"]["outbound"] == 0
+    assert result["summary"]["telegram_send_ok"] == 1
+    ev = result["raw_events"][0]
+    assert ev["type"] == "📤 Telegram回复成功"
+    assert ev["level"] == "INFO"
+
+
+def test_warn_no_longer_silently_dropped_after_level_fix():
+    """Before the level-path fix, a generic WARN with no specific category
+    landed in 'other' (empty level) and never reached raw_events. With the
+    fix it must surface as an unknown_error event so real WARNs are visible."""
+    from openclaw_audit import analyze
+    # A WARN that matches no specific category -> unknown_error bucket
+    msg = "skipped permission hardening for /Users/rosen/something"
+    entries = [("openclaw", "2026-06-20T23:00:00.000+07:00", "WARN", msg)]
+    result = analyze(entries)
+    assert len(result["other_errors"]) == 1
+    ev = result["raw_events"][0]
+    assert ev["level"] == "WARN"
+    assert ev["type"].startswith("❌")

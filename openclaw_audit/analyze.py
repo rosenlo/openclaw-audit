@@ -13,10 +13,11 @@ NON_FATAL_LITELLM_TYPES = {"deprecation_warning", "general_error", "other"}
 def analyze(entries, since=None):
     result = {
         "summary": {},
-        "telegram": {"inbound": 0, "outbound": 0, "errors": 0},
+        "telegram": {"inbound": 0, "outbound": 0, "errors": 0, "send_ok": 0},
         "llm": {"errors": 0, "aborts": 0, "timeouts": 0, "latencies": []},
         "context": {"overflows": 0, "compactions": {"success": 0, "incomplete": 0, "failed": 0}},
         "stalls": 0,
+        "transcript_mirror_failures": 0,
         "failovers": 0, "connection_issues": 0, "config_reloads": 0,
         "tool_errors": {"edit": 0, "read": 0},
         "incomplete_turns": 0, "other_errors": [],
@@ -67,6 +68,26 @@ def analyze(entries, since=None):
                 result["telegram"]["outbound"] += 1
                 if cat.get("error"):
                     result["telegram"]["errors"] += 1
+
+            elif etype == "telegram_send_ok":
+                # Send succeeded — count separately, NOT into outbound (see
+                # classify_entry note about double-counting with "message processed").
+                result["telegram"]["send_ok"] += 1
+                mid = cat.get("message_id")
+                detail = f"messageId={mid}" if mid else msg[:200]
+                result["raw_events"].append({
+                    "source": "openclaw", "time": ts_str, "type": "📤 Telegram回复成功",
+                    "detail": detail, "level": "INFO"
+                })
+
+            elif etype == "transcript_mirror_failed":
+                result["transcript_mirror_failures"] += 1
+                result["raw_events"].append({
+                    "source": "openclaw", "time": ts_str,
+                    "type": "📝 会话记录缺失",
+                    "detail": "消息已送达 Telegram,但 session transcript 镜像失败 (session file changed mid-turn)",
+                    "level": "WARN"
+                })
 
             elif etype == "llm_error":
                 result["llm"]["errors"] += 1
@@ -248,6 +269,7 @@ def analyze(entries, since=None):
         "total_events": total_events,
         "telegram_in": result["telegram"]["inbound"],
         "telegram_out": result["telegram"]["outbound"],
+        "telegram_send_ok": result["telegram"]["send_ok"],
         "llm_errors": result["llm"]["errors"],
         "llm_aborts": result["llm"]["aborts"],
         "llm_timeouts": result["llm"]["timeouts"],
@@ -257,6 +279,7 @@ def analyze(entries, since=None):
         "compaction_success": result["context"]["compactions"]["success"],
         "incomplete_turns": result["incomplete_turns"],
         "connection_issues": result["connection_issues"],
+        "transcript_mirror_failures": result["transcript_mirror_failures"],
         "config_reloads": result["config_reloads"],
         "edit_fails": result["tool_errors"]["edit"],
         "avg_llm_latency": None,
