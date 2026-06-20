@@ -70,6 +70,15 @@ Copy the example file if you want a local env file:
 cp .env.example .env
 ```
 
+## LiteLLM log format
+
+LiteLLM's `err.log` is written by its in-process `logging` formatter, whose `datefmt` is hardcoded to `%H:%M:%S` (no date). That leaves every line with only a time-of-day, which this tool used to infer the date from line order — fragile, because same-day log reordering looked like a midnight crossing and mis-stamped events onto the next day (breaking the time sort).
+
+The fix has two sides:
+
+- **LiteLLM side (recommended):** set `JSON_LOGS=true` in the LiteLLM process environment so it emits one JSON object per line with a full ISO-8601 `timestamp` (date + year). `LITELLM_LOG=DEBUG` controls the level separately. Note: it's `JSON_LOGS`, not `LITELLM_LOG=JSON` — the latter is parsed as a log level and will raise.
+- **This tool:** parses JSON lines directly, and still supports the legacy `HH:MM:SS` text format for back-compat, with a 12h threshold on the midnight-inference backstep so small same-day reordering no longer flips the date.
+
 ## Notes
 
 - The tool reads local logs and local SQLite state. It does not send data anywhere by itself.

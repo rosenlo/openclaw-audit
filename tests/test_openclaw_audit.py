@@ -234,3 +234,149 @@ def test_cli_event_list_shows_full_date_with_year(capsys):
     # noise reduction), not a credential emergency.
     assert "/models" in out
     assert "不影响" in out
+
+
+# ─── JSON log format (JSON_LOGS=true) ─────────────────────────────────
+def _write_tmp_log(lines):
+    import tempfile, os
+    tf = tempfile.NamedTemporaryFile("w", suffix=".log", delete=False)
+    tf.writelines(lines)
+    tf.close()
+    return tf.name
+
+
+def test_litellm_json_log_parsed_with_real_date():
+    """JSON_LOGS=true lines carry a full ISO timestamp with date+year. The
+    parser must use it directly instead of inferring from HH:MM:SS."""
+    from openclaw_audit import parsing
+    line = (
+        '{"message": "litellm.proxy.proxy_server.user_api_key_auth(): '
+        'Exception occured - No api key passed in.", "level": "ERROR", '
+        '"timestamp": "2026-06-20T22:25:57.123456", '
+        '"component": "LiteLLM Proxy", "logger": "auth_exception_handler.py:97"}\n'
+    )
+    path = _write_tmp_log([line])
+    try:
+        orig = parsing.LITELLM_ERR_LOG
+        parsing.LITELLM_ERR_LOG = path
+        entries = parsing.parse_litellm_err_log(since=None)
+    finally:
+        parsing.LITELLM_ERR_LOG = orig
+        import os; os.unlink(path)
+
+    assert len(entries) == 1
+    src, ts, level, msg = entries[0]
+    assert src == "litellm"
+    assert ts == "2026-06-20T22:25:57+07:00", ts
+    assert level == "ERROR"
+    # auth substrings must survive into the detail so classify_litellm_entry
+    # still buckets this as auth_error, not proxy_exception.
+    assert "auth_exception_handler" in msg
+    assert "user_api_key_auth" in msg
+    assert "No api key passed" in msg
+
+
+def test_litellm_json_log_classifies_as_auth_error():
+    """End-to-end: a JSON auth line flows through analyze as auth_error."""
+    from openclaw_audit import analyze, parsing
+    line = (
+        '{"message": "litellm.proxy.proxy_server.user_api_key_auth(): '
+        'Exception occured - No api key passed in.", "level": "ERROR", '
+        '"timestamp": "2026-06-20T22:25:57.000000", '
+        '"component": "LiteLLM Proxy", "logger": "auth_exception_handler.py:97"}\n'
+    )
+    path = _write_tmp_log([line])
+    try:
+        orig = parsing.LITELLM_ERR_LOG
+        parsing.LITELLM_ERR_LOG = path
+        entries = parsing.parse_litellm_err_log(since=None)
+    finally:
+        parsing.LITELLM_ERR_LOG = orig
+        import os; os.unlink(path)
+
+    result = analyze(entries)
+    assert result["litellm"]["auth_errors"] == 1
+    assert result["litellm"]["proxy_exceptions"] == 0
+    assert result["raw_events"][0]["type"] == "🔑 Litellm鉴权失败"
+
+
+def test_litellm_json_and_text_lines_coexist():
+    """A file may contain both JSON lines and legacy text lines (e.g. during
+    a config flip). Both must parse, each with its own correct date."""
+    from openclaw_audit import parsing
+    lines = [
+        # legacy text line, same day
+        "22:25:03 - LiteLLM Router:ERROR: auth_exception_handler.py:97 - "
+        "No api key passed in.\n",
+        # JSON line a bit later
+        '{"message": "something else", "level": "WARNING", '
+        '"timestamp": "2026-06-20T22:40:07.000000", "component": "LiteLLM", '
+        '"logger": "utils.py:768"}\n',
+    ]
+    path = _write_tmp_log(lines)
+    try:
+        orig = parsing.LITELLM_ERR_LOG
+        parsing.LITELLM_ERR_LOG = path
+        entries = parsing.parse_litellm_err_log(since=None)
+    finally:
+        parsing.LITELLM_ERR_LOG = orig
+        import os; os.unlink(path)
+
+    assert len(entries) == 2
+    # JSON entry keeps its own real date; text entry keeps today's date.
+    dates = {e[1].split("T")[0] for e in entries}
+    assert "2026-06-20" in dates
+
+
+def test_litellm_text_same_day_reorder_not_misread_as_midnight():
+    """The original bug: text lines 22:25:53 followed by 22:22:24 (a small
+    backwards step from same-day reordering) were misread as a midnight
+    crossing and stamped on the next day, floating them above later events
+    in the sort. With the 12h threshold, the small backstep must NOT advance
+    the date."""
+    from openclaw_audit import parsing
+    lines = [
+        "22:25:53 - LiteLLM Router:ERROR: auth_exception_handler.py:97 - "
+        "No api key passed in.\n",
+        "22:22:24 - LiteLLM Router:ERROR: auth_exception_handler.py:97 - "
+        "No api key passed in.\n",
+        "22:42:22 - LiteLLM Router:ERROR: auth_exception_handler.py:97 - "
+        "No api key passed in.\n",
+    ]
+    path = _write_tmp_log(lines)
+    try:
+        orig = parsing.LITELLM_ERR_LOG
+        parsing.LITELLM_ERR_LOG = path
+        entries = parsing.parse_litellm_err_log(since=None)
+    finally:
+        parsing.LITELLM_ERR_LOG = orig
+        import os; os.unlink(path)
+
+    assert len(entries) == 3
+    # All three must share one date — none promoted to "tomorrow".
+    dates = {e[1].split("T")[0] for e in entries}
+    assert len(dates) == 1, f"same-day reorder should not split dates, got {dates}"
+
+
+def test_litellm_text_real_midnight_still_advances():
+    """A genuine midnight crossing (23:59 -> 00:01) is a large backstep and
+    must still advance the date by one day. Guards the threshold against
+    being so strict it breaks real cross-midnight logs."""
+    from openclaw_audit import parsing
+    lines = [
+        "23:59:58 - LiteLLM Router:ERROR: late-night error\n",
+        "00:01:05 - LiteLLM Router:ERROR: after-midnight error\n",
+    ]
+    path = _write_tmp_log(lines)
+    try:
+        orig = parsing.LITELLM_ERR_LOG
+        parsing.LITELLM_ERR_LOG = path
+        entries = parsing.parse_litellm_err_log(since=None)
+    finally:
+        parsing.LITELLM_ERR_LOG = orig
+        import os; os.unlink(path)
+
+    assert len(entries) == 2
+    d1 = entries[0][1].split("T")[0]
+    d2 = entries[1][1].split("T")[0]
+    assert d2 > d1, f"expected date to advance across midnight: {d1} -> {d2}"
