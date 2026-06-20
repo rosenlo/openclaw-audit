@@ -1222,7 +1222,7 @@ def web_mode(args):
       {% set cls = '' %}
     {% endif %}
     <div class="card">
-      <div class="label">{{ sess.kind }} ({{ sess.model }}) <span style="color:#565f89;font-weight:normal">@{{ sess.clientUpdatedAt if sess.clientUpdatedAt else '??' }}</span> <span style="color:#334;font-weight:normal">id:{{ sess.sessionId if sess.sessionId else sess.key }}</span></div>
+      <div class="label">{{ sess.kind }} ({{ sess.model }}) <span style="color:#565f89;font-weight:normal">@{{ sess.clientUpdatedAt if sess.clientUpdatedAt else '??' }}</span> <span style="color:#565f89;font-weight:normal">id:{{ sess.sessionId if sess.sessionId else sess.key }}</span></div>
       <div class="value {{ cls }}">{% if sess_failed %}FAILED{% elif has_tok %}{{ '%.0f'|format(pct) }}%{% else %}N/A{% endif %}</div>
       <div class="sublabel">{% if sess_failed %}❌ 子会话已失败{% elif has_tok %}{{ '{:,}'.format(sess.totalTokens) }}/{{ '{:,}'.format(sess.contextTokens) }}{% else %}N/A/{% endif %}</div>
     </div>
