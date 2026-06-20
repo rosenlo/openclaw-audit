@@ -1,0 +1,29 @@
+name: test
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.9"
+
+      - name: Install pytest
+        run: python3 -m pip install --upgrade pip pytest
+
+      - name: Compile all modules
+        run: python3 -m py_compile openclaw-audit.py openclaw_audit/*.py tests/test_openclaw_audit.py conftest.py
+
+      - name: Run tests
+        run: python3 -m pytest tests/ -v
