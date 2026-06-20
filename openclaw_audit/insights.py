@@ -18,7 +18,7 @@ def build_suggestions(result, tg_result=None):
     if s["llm_aborts"] > 0:
         suggestions.append("🟡 LLM 请求被 abort / failover — 优先看上游链路而不是 Telegram")
     if l.get("auth_errors", 0) > 0:
-        suggestions.append("🔴 LiteLLM 鉴权失败 — 检查 API key 配置 / virtual key 是否过期或缺失")
+        suggestions.append("⚪ LiteLLM 鉴权失败 — 通常是本机 /models 探测请求未带 key（No api key passed），不影响聊天链路；若非本机请求再查 API key 配置")
     if l.get("proxy_exceptions", 0) > 0:
         suggestions.append("🔴 LiteLLM 代理异常 — 先查 LitellM / proxy 日志")
     if l.get("upstream_timeouts", 0) > 0:
@@ -83,8 +83,9 @@ def build_root_cause_summary(result):
     if top_name == "LiteLLM 鉴权失败":
         return (
             f"主要问题是 LiteLLM 鉴权失败，共 {top_count} 次。"
-            f"请求没带有效 API key（No api key passed），属于配置/凭证问题，"
-            f"不是上游模型或 Telegram 链路问题。优先检查 virtual key 是否过期或缺失。"
+            f"这是 /models 端点收到未带 API key 的请求（No api key passed），"
+            f"通常来自本机的模型列表探测/定时刷新，不影响实际的 /chat/completions 聊天链路。"
+            f"若确认非本机请求，再排查调用方的 key 配置。"
         )
     if top_name == "LiteLLM 代理异常":
         return (
