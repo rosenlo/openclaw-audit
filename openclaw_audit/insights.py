@@ -33,6 +33,8 @@ def build_suggestions(result, tg_result=None):
         suggestions.append("🟡 Telegram连接不稳 — 检查网络/代理, 多数自动恢复")
     if s["edit_fails"] > 5:
         suggestions.append("🟡 Edit工具失败过多 — 长文本编辑建议用 Write 替代 Edit")
+    if s.get("transcript_mirror_failures", 0) > 0:
+        suggestions.append("🟡 会话记录镜像失败 — 消息已送达 Telegram 但 session transcript 缺失,留意后续 compaction 是否丢上下文")
     if tg_result.get("errors", 0) > 0:
         suggestions.append("🔴 Telegram 回复失败 — 需关注消息发送链路")
     if l.get("warnings", 0) > 0:
@@ -62,6 +64,8 @@ def build_root_cause_summary(result):
         ranked.append(("上下文溢出", s["context_overflows"], "context overflow / compaction"))
     if s["connection_issues"] > 0:
         ranked.append(("Telegram 连接问题", s["connection_issues"], "fetch timeout / closed before connect"))
+    if s.get("transcript_mirror_failures", 0) > 0:
+        ranked.append(("会话记录镜像失败", s.get("transcript_mirror_failures", 0), "session file changed mid-turn"))
 
     if not ranked:
         return "本窗口未见明显异常，链路整体正常。"
@@ -101,6 +105,12 @@ def build_root_cause_summary(result):
         return (
             f"主要问题是上下文溢出，共 {top_count} 次。"
             f"这会导致 compact / truncate 触发，长任务更容易看起来被打断。"
+        )
+    if top_name == "会话记录镜像失败":
+        return (
+            f"主要问题是会话记录镜像失败，共 {top_count} 次。"
+            f"消息已送达 Telegram，但 session transcript 因 session file 在 turn 中途被改动"
+            f"（通常是 compaction 轮转）而没写入，后续 compaction/上下文回放可能缺失该条。"
         )
     return (
         f"主要问题是 Telegram 连接问题，共 {top_count} 次。"

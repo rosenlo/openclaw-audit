@@ -72,6 +72,31 @@ def classify_entry(msg, level):
                     pass
         return cat
 
+    # Telegram send succeeded (subsystem telegram/send). High-frequency
+    # "message delivered" line — give it its own type so it stops falling
+    # through to "other". Not counted into telegram.outbound here because
+    # the legacy "message processed" line also covers outbound; counting
+    # both would double-count until we confirm they never co-occur.
+    if "telegram outbound send ok" in ml:
+        cat["type"] = "telegram_send_ok"
+        for part in msg.split():
+            if part.startswith("messageId="):
+                cat["message_id"] = part.split("=", 1)[1]
+            elif part.startswith("chatId="):
+                cat["chat_id"] = part.split("=", 1)[1]
+        return cat
+
+    # Outbound delivery was mirrored into the session transcript, but the
+    # session file had changed underneath the deliverer (typically because
+    # a compaction rotated the transcript mid-turn). The channel send to
+    # Telegram already succeeded, so the user saw the reply — but the
+    # session transcript is now missing that delivery, which can break
+    # later compaction/context replay. Surfaced as its own category so it
+    # is not buried under generic WARN noise.
+    if "failed to mirror" in ml and "session transcript" in ml:
+        cat["type"] = "transcript_mirror_failed"
+        return cat
+
     if "model-fetch" in ml and "error" in ml:
         cat["type"] = "llm_error"
         for part in msg.split():

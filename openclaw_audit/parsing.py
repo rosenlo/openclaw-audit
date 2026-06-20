@@ -28,7 +28,15 @@ def parse_openclaw_log(filepath):
                     d = json.loads(line)
                 except json.JSONDecodeError:
                     continue
+                # logLevelName lives under _meta in real OpenClaw logs (the
+                # top-level field is absent), so look there too — otherwise
+                # every line's level comes back empty and all WARN/ERROR
+                # events get mis-bucketed as "other" and silently dropped.
                 level = d.get("logLevelName", "")
+                if not level:
+                    meta = d.get("_meta")
+                    if isinstance(meta, dict):
+                        level = meta.get("logLevelName", "")
                 msg = d.get("message", "")
                 if not msg:
                     try:
