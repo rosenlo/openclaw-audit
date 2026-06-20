@@ -1,18 +1,10 @@
-import importlib.util
-from pathlib import Path
-
-
-MODULE_PATH = Path(__file__).resolve().parents[1] / "openclaw-audit.py"
-SPEC = importlib.util.spec_from_file_location("openclaw_audit", MODULE_PATH)
-openclaw_audit = importlib.util.module_from_spec(SPEC)
-assert SPEC and SPEC.loader
-SPEC.loader.exec_module(openclaw_audit)
-
-INSIGHTS_PATH = Path(__file__).resolve().parents[1] / "openclaw_audit_insights.py"
-INSIGHTS_SPEC = importlib.util.spec_from_file_location("openclaw_audit_insights", INSIGHTS_PATH)
-openclaw_audit_insights = importlib.util.module_from_spec(INSIGHTS_SPEC)
-assert INSIGHTS_SPEC and INSIGHTS_SPEC.loader
-INSIGHTS_SPEC.loader.exec_module(openclaw_audit_insights)
+import openclaw_audit
+from openclaw_audit import (
+    analyze,
+    build_root_cause_summary,
+    build_suggestions,
+    classify_entry,
+)
 
 
 def test_classify_entry_detects_stalled_session():
@@ -24,7 +16,7 @@ def test_classify_entry_detects_stalled_session():
         "lastProgress=model_call:started lastProgressAge=122s recovery=none"
     )
 
-    cat = openclaw_audit.classify_entry(msg, "WARN")
+    cat = classify_entry(msg, "WARN")
 
     assert cat["type"] == "stalled_session"
     assert cat["reason"] == "active_work_without_progress"
@@ -36,7 +28,7 @@ def test_classify_entry_detects_stalled_session():
 def test_classify_entry_marks_llm_abort():
     msg = "model-fetch error provider=litellm elapsedMs=17600 AbortError: request aborted"
 
-    cat = openclaw_audit.classify_entry(msg, "ERROR")
+    cat = classify_entry(msg, "ERROR")
 
     assert cat["type"] == "llm_error"
     assert cat["reason"] == "abort"
@@ -63,8 +55,8 @@ def test_analyze_separates_stall_from_telegram_failure():
         ),
     ]
 
-    result = openclaw_audit.analyze(entries)
-    suggestions = openclaw_audit.build_suggestions(result, {"errors": 0})
+    result = analyze(entries)
+    suggestions = build_suggestions(result, {"errors": 0})
 
     assert result["summary"]["session_stalls"] == 1
     assert result["summary"]["llm_aborts"] == 1
@@ -89,6 +81,20 @@ def test_build_root_cause_summary_prioritizes_stall():
         },
     }
 
-    summary = openclaw_audit_insights.build_root_cause_summary(result)
+    summary = build_root_cause_summary(result)
 
     assert "执行层卡住" in summary
+
+
+def test_package_exports_public_api():
+    """The thin CLI wrapper relies on these names being importable from the
+    top-level package. Lock the public surface so a future move doesn't
+    silently break `openclaw-audit.py`."""
+    for name in [
+        "analyze", "classify_entry", "classify_litellm_entry",
+        "build_suggestions", "build_root_cause_summary",
+        "parse_openclaw_logs_since", "parse_litellm_err_log",
+        "query_sessions", "query_sqlite", "print_report",
+        "HTML_TEMPLATE", "now_local",
+    ]:
+        assert hasattr(openclaw_audit, name), f"openclaw_audit missing {name}"
