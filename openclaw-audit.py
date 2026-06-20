@@ -25,6 +25,8 @@ import json, sys, os, sqlite3, glob, time, argparse, re, shutil
 from datetime import datetime, timedelta, timezone
 from collections import Counter, defaultdict
 
+from openclaw_audit_insights import build_root_cause_summary, build_suggestions
+
 # ─── 路径配置 ───────────────────────────────────────────────────────
 # 所有路径均可通过环境变量覆盖，便于公开仓库使用。
 # 环境变量不存在时使用通用 fallback（不暴露特定用户路径）。
@@ -121,6 +123,17 @@ def _session_id_from_key(key):
     if not key:
         return ""
     return key.split(":")[-1]
+
+
+def _extract_fields(msg, wanted):
+    """Extract key=value fields from a log message."""
+    wanted = set(wanted)
+    found = {}
+    for m in re.finditer(r"(\w+)=([^\s]+)", msg):
+        key = m.group(1)
+        if key in wanted:
+            found[key] = m.group(2)
+    return found
 
 
 
@@ -331,6 +344,28 @@ def classify_entry(msg, level):
         cat["reason"] = "abort" if ("AbortError" in msg or "abort" in ml) else "error"
         return cat
 
+    if "stalled session" in ml or "active_work_without_progress" in ml or "stalled_agent_run" in ml:
+        cat["type"] = "stalled_session"
+        cat.update(
+            _extract_fields(
+                msg,
+                [
+                    "sessionId",
+                    "sessionKey",
+                    "state",
+                    "age",
+                    "queueDepth",
+                    "reason",
+                    "classification",
+                    "activeWorkKind",
+                    "lastProgress",
+                    "lastProgressAge",
+                    "recovery",
+                ],
+            )
+        )
+        return cat
+
     if "context overflow" in ml or "context-overflow" in ml:
         cat["type"] = "context_overflow"
         cat["subtype"] = "precheck" if "precheck" in ml else ("diagnostic" if "diag" in ml else "detected")
@@ -429,8 +464,9 @@ def analyze(entries, since=None):
     result = {
         "summary": {},
         "telegram": {"inbound": 0, "outbound": 0, "errors": 0},
-        "llm": {"errors": 0, "timeouts": 0, "latencies": []},
+        "llm": {"errors": 0, "aborts": 0, "timeouts": 0, "latencies": []},
         "context": {"overflows": 0, "compactions": {"success": 0, "incomplete": 0, "failed": 0}},
+        "stalls": 0,
         "failovers": 0, "connection_issues": 0, "config_reloads": 0,
         "tool_errors": {"edit": 0, "read": 0},
         "incomplete_turns": 0, "other_errors": [],
@@ -440,6 +476,10 @@ def analyze(entries, since=None):
             "total_requests": 0, "streaming_responses": 0,
             "status_codes": {},
             "upstream_timeouts": 0, "upstream_errors": 0,
+            "upstream_connections": 0,
+            "fallback_failures": 0,
+            "proxy_exceptions": 0,
+            "general_errors": 0,
             "warnings": 0,
         },
     }
@@ -479,12 +519,32 @@ def analyze(entries, since=None):
 
             elif etype == "llm_error":
                 result["llm"]["errors"] += 1
+                if cat.get("reason") == "abort":
+                    result["llm"]["aborts"] += 1
                 elapsed = cat.get("elapsed_ms", 0)
                 if elapsed:
                     result["llm"]["latencies"].append(elapsed / 1000.0)
                 result["raw_events"].append({
                     "source": "openclaw", "time": ts_str, "type": "❌ LLM错误",
                     "detail": f"provider={cat.get('provider','?')} elapsed={fmt_duration(elapsed/1000 if elapsed else None)} reason={cat.get('reason','?')}",
+                    "level": "ERROR"
+                })
+
+            elif etype == "stalled_session":
+                result["stalls"] += 1
+                detail_parts = [
+                    f"reason={cat.get('reason','?')}",
+                    f"classification={cat.get('classification','?')}",
+                    f"state={cat.get('state','?')}",
+                    f"age={cat.get('age','?')}",
+                    f"lastProgressAge={cat.get('lastProgressAge','?')}",
+                    f"queueDepth={cat.get('queueDepth','?')}",
+                ]
+                if cat.get("activeWorkKind"):
+                    detail_parts.append(f"activeWorkKind={cat['activeWorkKind']}")
+                result["raw_events"].append({
+                    "source": "openclaw", "time": ts_str, "type": "⏸ 卡住会话",
+                    "detail": " ".join(detail_parts),
                     "level": "ERROR"
                 })
 
@@ -585,6 +645,7 @@ def analyze(entries, since=None):
 
             elif etype == "upstream_connection":
                 result["litellm"]["upstream_errors"] += 1
+                result["litellm"]["upstream_connections"] += 1
                 litellm_err_counts["upstream_connection"] += 1
                 result["raw_events"].append({
                     "source": "litellm", "time": ts_str, "type": "🔌 Litellm连接错误",
@@ -593,6 +654,7 @@ def analyze(entries, since=None):
 
             elif etype == "upstream_fallback_failed":
                 result["litellm"]["upstream_errors"] += 1
+                result["litellm"]["fallback_failures"] += 1
                 litellm_err_counts["fallback_failed"] += 1
                 result["raw_events"].append({
                     "source": "litellm", "time": ts_str, "type": "❌ Litellm Fallback失败",
@@ -601,6 +663,7 @@ def analyze(entries, since=None):
 
             elif etype == "proxy_exception":
                 result["litellm"]["upstream_errors"] += 1
+                result["litellm"]["proxy_exceptions"] += 1
                 litellm_err_counts["proxy_exception"] += 1
                 result["raw_events"].append({
                     "source": "litellm", "time": ts_str, "type": "❌ Litellm代理异常",
@@ -612,6 +675,7 @@ def analyze(entries, since=None):
 
             elif etype == "general_error":
                 result["litellm"]["upstream_errors"] += 1
+                result["litellm"]["general_errors"] += 1
 
     # ── Also read litellm.out log for request stats ──
     litellm_out = parse_litellm_out_log(since)
@@ -626,7 +690,9 @@ def analyze(entries, since=None):
         "telegram_in": result["telegram"]["inbound"],
         "telegram_out": result["telegram"]["outbound"],
         "llm_errors": result["llm"]["errors"],
+        "llm_aborts": result["llm"]["aborts"],
         "llm_timeouts": result["llm"]["timeouts"],
+        "session_stalls": result["stalls"],
         "failovers": result["failovers"],
         "context_overflows": result["context"]["overflows"],
         "compaction_success": result["context"]["compactions"]["success"],
@@ -638,6 +704,10 @@ def analyze(entries, since=None):
         "litellm_requests": result["litellm"]["total_requests"],
         "litellm_upstream_timeouts": result["litellm"]["upstream_timeouts"],
         "litellm_upstream_errors": result["litellm"]["upstream_errors"],
+        "litellm_upstream_connections": result["litellm"]["upstream_connections"],
+        "litellm_fallback_failures": result["litellm"]["fallback_failures"],
+        "litellm_proxy_exceptions": result["litellm"]["proxy_exceptions"],
+        "litellm_general_errors": result["litellm"]["general_errors"],
     }
 
     if result["llm"]["latencies"]:
@@ -838,9 +908,15 @@ def print_report(result, sqlite_info, sessions_info=None):
     if s["llm_timeouts"] > 0:
         score -= min(s["llm_timeouts"] * 15, 60)
         deductions.append(f"LLM超时 {s['llm_timeouts']}次")
+    if s["llm_aborts"] > 0:
+        score -= min(s["llm_aborts"] * 8, 24)
+        deductions.append(f"LLM中断 {s['llm_aborts']}次")
     if s["litellm_upstream_timeouts"] > 0:
         score -= min(s["litellm_upstream_timeouts"] * 10, 40)
         deductions.append(f"Litellm上游超时 {s['litellm_upstream_timeouts']}次")
+    if s["session_stalls"] > 0:
+        score -= min(s["session_stalls"] * 6, 24)
+        deductions.append(f"任务卡住 {s['session_stalls']}次")
     if s["failovers"] > 0:
         score -= min(s["failovers"] * 5, 20)
     if s["incomplete_turns"] > 0:
@@ -863,7 +939,9 @@ def print_report(result, sqlite_info, sessions_info=None):
     print(f"     ├─ Telegram 消息:        {CYAN(str(s['telegram_in']))} 条")
     print(f"     ├─ Telegram 回复:        {s['telegram_out']} 条 (错误: {RED(str(tg_result['errors'])) if tg_result['errors'] else '0'})")
     print(f"     ├─ LLM 调用错误:         {RED(str(s['llm_errors'])) if s['llm_errors'] else GREEN('0')} 次")
+    print(f"     ├─ LLM 中断:             {YELLOW(str(s['llm_aborts'])) if s['llm_aborts'] else GREEN('0')} 次")
     print(f"     ├─ LLM 超时:             {RED(str(s['llm_timeouts'])) if s['llm_timeouts'] else GREEN('0')} 次")
+    print(f"     ├─ 执行卡住:             {YELLOW(str(s['session_stalls'])) if s['session_stalls'] else GREEN('0')} 次")
     print(f"     ├─ Failover:             {YELLOW(str(s['failovers'])) if s['failovers'] else GREEN('0')} 次")
     print(f"     ├─ 上下文溢出:            {YELLOW(str(s['context_overflows'])) if s['context_overflows'] else GREEN('0')} 次")
     print(f"     ├─ 上下文压缩成功率:      {s['compaction_success']}/{s['compaction_success'] + result['context']['compactions']['incomplete']}")
@@ -880,7 +958,10 @@ def print_report(result, sqlite_info, sessions_info=None):
     print(f"     ├─ 流式响应:              {l['streaming_responses']} 次")
     print(f"     ├─ 状态码分布:            {codes_str}")
     print(f"     ├─ 上游超时:              {RED(str(l['upstream_timeouts'])) if l['upstream_timeouts'] else GREEN('0')} 次")
-    print(f"     └─ 上游连接错误:          {RED(str(l['upstream_errors'])) if l['upstream_errors'] else GREEN('0')} 次")
+    print(f"     ├─ 上游连接错误:          {RED(str(l['upstream_connections'])) if l['upstream_connections'] else GREEN('0')} 次")
+    print(f"     ├─ Fallback失败:          {RED(str(l['fallback_failures'])) if l['fallback_failures'] else GREEN('0')} 次")
+    print(f"     ├─ 代理异常:              {RED(str(l['proxy_exceptions'])) if l['proxy_exceptions'] else GREEN('0')} 次")
+    print(f"     └─ 上游错误总数:          {RED(str(l['upstream_errors'])) if l['upstream_errors'] else GREEN('0')} 次")
 
     if l["warnings"]:
         print(f"     └─ 配置警告:              {YELLOW(str(l['warnings']))} 次 (set_verbose 已弃用)")
@@ -974,23 +1055,8 @@ def print_report(result, sqlite_info, sessions_info=None):
     # ── 建议 ──
     print()
     print(BOLD("  💡 建议"))
-    suggestions = []
-    if s["llm_timeouts"] >= 3:
-        suggestions.append("🔴 LLM 频繁超时 — 检查 litellm upstream 响应速度, 或降低 litellm 的 request_timeout 配置")
-    if l["upstream_timeouts"] >= 5:
-        suggestions.append("🔴 Litellm 上游(agnes)频繁超时 — 上游 API 响应慢, 建议检查 agnes API 状态或增大 timeout 配置")
-    if s["context_overflows"] > 3:
-        suggestions.append("🟡 上下文溢出频繁 — 考虑定期 /new 开始新对话, 或减少单轮 Tool 调用量")
-    if s["connection_issues"] > 2:
-        suggestions.append("🟡 Telegram连接不稳 — 检查网络/代理, 多数自动恢复")
-    if s["edit_fails"] > 5:
-        suggestions.append("🟡 Edit工具失败过多 — 长文本编辑建议用 Write 替代 Edit")
-    if tg_result["errors"] > 0:
-        suggestions.append("🔴 Telegram 回复失败 — 需关注 LLM 链路可用性")
-    if l["warnings"] > 0:
-        suggestions.append("🟡 Litellm 配置警告 — 将 set_verbose 改为 LITELLM_LOG=DEBUG 环境变量")
-    if not suggestions:
-        suggestions.append("✅ 系统运行正常")
+    suggestions = build_suggestions(result, tg_result)
+    print(f"     {build_root_cause_summary(result)}")
 
     for sug in suggestions:
         print(f"     {sug}")
@@ -1139,6 +1205,11 @@ def web_mode(args):
       <div class="sublabel">回复 {{ data.summary.telegram_out }} 条{% if data.telegram.errors > 0 %} / {{ data.telegram.errors }} ❌{% endif %}</div>
     </div>
     <div class="card">
+      <div class="label">执行卡住</div>
+      <div class="value {% if data.summary.session_stalls > 0 %}warn{% else %}good{% endif %}">{{ data.summary.session_stalls }}</div>
+      <div class="sublabel">active_work_without_progress</div>
+    </div>
+    <div class="card">
       <div class="label">Failover</div>
       <div class="value {% if data.failovers > 0 %}warn{% else %}good{% endif %}">{{ data.failovers }}</div>
     </div>
@@ -1167,6 +1238,11 @@ def web_mode(args):
       <div class="label">总请求量</div>
       <div class="value good">{{ data.litellm.total_requests }}</div>
       <div class="sublabel">流式 {{ data.litellm.streaming_responses }} 次</div>
+    </div>
+    <div class="card">
+      <div class="label">LLM 中断</div>
+      <div class="value {% if data.summary.llm_aborts > 0 %}warn{% else %}good{% endif %}">{{ data.summary.llm_aborts }}</div>
+      <div class="sublabel">abort / failover</div>
     </div>
     <div class="card">
       <div class="label">上游超时</div>
@@ -1324,26 +1400,7 @@ async function load() {
     def index():
         since_param = request.args.get("since", "1h")
         data = get_data(since_param)
-        s = data["summary"]
-        l = data["litellm"]
-
-        suggestions = []
-        if s["llm_timeouts"] >= 3:
-            suggestions.append("🔴 LLM 频繁超时 — 检查 litellm upstream 响应速度")
-        if l["upstream_timeouts"] >= 5:
-            suggestions.append("🔴 Litellm 上游超时(agnes) — 检查 API 状态或增大 timeout")
-        if data["context"]["overflows"] > 3:
-            suggestions.append("🟡 上下文溢出频繁 — 考虑 /new 开始新对话")
-        if data["connection_issues"] > 2:
-            suggestions.append("🟡 Telegram连接不稳")
-        if data["tool_errors"]["edit"] > 5:
-            suggestions.append("🟡 Edit失败过多")
-        if data["telegram"]["errors"] > 0:
-            suggestions.append("🔴 Telegram 回复失败")
-        if l["warnings"] > 0:
-            suggestions.append("🟡 Litellm 配置警告 — set_verbose → LITELLM_LOG=DEBUG")
-        if not suggestions:
-            suggestions.append("✅ 系统运行正常")
+        suggestions = [build_root_cause_summary(data)] + build_suggestions(data, data["telegram"])
 
         sqlite_info = query_sqlite()
         data["sqlite"] = sqlite_info
