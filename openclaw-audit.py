@@ -116,6 +116,13 @@ def _fmt_ts(ts):
     return ""
 
 
+def _session_id_from_key(key):
+    """Extract the trailing session id from a colon-delimited session key."""
+    if not key:
+        return ""
+    return key.split(":")[-1]
+
+
 
 def fmt_duration(sec):
     if sec is None:
@@ -742,8 +749,9 @@ def query_sessions():
                 "usagePct": pct,
                 "hasTokens": has_tokens,
                 "isFailed": total is None and s.get("kind") == "spawn-child",
-                "key": s.get("key", "")[-50:],
-                "sessionId": s.get("sessionId", ""),
+                # Preserve the full key so the UI can derive the session id later.
+                "key": s.get("key", ""),
+                "sessionId": _session_id_from_key(s.get("key", "")),
                 "updatedAt": s.get("updatedAt"),
                 "clientUpdatedAt": _fmt_ts(s.get("updatedAt")),
             }
@@ -924,11 +932,12 @@ def print_report(result, sqlite_info, sessions_info=None):
             model = sess["model"]
             updated_display = sess.get("clientUpdatedAt", "")
             timestamp_tag = f" {DIM(chr(64) + updated_display)}" if updated_display else ""
+            sess_id = sess.get("sessionId", "") or _session_id_from_key(sess.get("key", ""))
             # 失败会话优先标记
             if sess.get("isFailed"):
-                print(f"     [{kind:8}] {RED('❌ FAILED')} {'—'} {sess.get('totalTokens', '?')}/{sess['contextTokens']:,} {model}{timestamp_tag}")
+                print(f"     [{kind:8}] {RED('❌ FAILED')} {'—'} {sess.get('totalTokens', '?')}/{sess['contextTokens']:,} {model}{timestamp_tag}  {DIM(f'id:{sess_id}')}")
             elif not has_tokens:
-                print(f"     [{kind:8}] {'N/A':>5} {'—'} {sess.get('totalTokens', '?')}/{sess['contextTokens']:,} {model}{timestamp_tag}")
+                print(f"     [{kind:8}] {'N/A':>5} {'—'} {sess.get('totalTokens', '?')}/{sess['contextTokens']:,} {model}{timestamp_tag}  {DIM(f'id:{sess_id}')}")
             else:
                 pct_val = pct or 0
                 bar_len = int(pct_val / 100 * 25)
@@ -936,7 +945,7 @@ def print_report(result, sqlite_info, sessions_info=None):
                 color_f = GREEN if pct_val < 50 else (YELLOW if pct_val < 80 else RED)
                 total_display = f"{sess['totalTokens']:,}"
                 ctx_display = f"{sess['contextTokens']:,}"
-                print(f"     [{kind:8}] {color_f(f'{pct_val:5.1f}%')} {bar} {total_display}/{ctx_display} {model}{timestamp_tag}")
+                print(f"     [{kind:8}] {color_f(f'{pct_val:5.1f}%')} {bar} {total_display}/{ctx_display} {model}{timestamp_tag}  {DIM(f'id:{sess_id}')}")
 
     # ── 关键事件 ──
     events = result.get("raw_events", [])
@@ -1213,7 +1222,7 @@ def web_mode(args):
       {% set cls = '' %}
     {% endif %}
     <div class="card">
-      <div class="label">{{ sess.kind }} ({{ sess.model }}) <span style="color:#565f89;font-weight:normal">@{{ sess.clientUpdatedAt if sess.clientUpdatedAt else '??' }}</span></div>
+      <div class="label">{{ sess.kind }} ({{ sess.model }}) <span style="color:#565f89;font-weight:normal">@{{ sess.clientUpdatedAt if sess.clientUpdatedAt else '??' }}</span> <span style="color:#334;font-weight:normal">id:{{ sess.sessionId if sess.sessionId else sess.key }}</span></div>
       <div class="value {{ cls }}">{% if sess_failed %}FAILED{% elif has_tok %}{{ '%.0f'|format(pct) }}%{% else %}N/A{% endif %}</div>
       <div class="sublabel">{% if sess_failed %}❌ 子会话已失败{% elif has_tok %}{{ '{:,}'.format(sess.totalTokens) }}/{{ '{:,}'.format(sess.contextTokens) }}{% else %}N/A/{% endif %}</div>
     </div>
