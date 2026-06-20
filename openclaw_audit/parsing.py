@@ -8,7 +8,7 @@ import sys
 from collections import Counter
 from datetime import datetime
 
-from .config import LOG_DIR, LITELLM_ERR_LOG, LITELLM_OUT_LOG, TODAY
+from .config import LOG_DIR, LITELLM_ERR_LOG, LITELLM_OUT_LOG, now_local
 from .util import parse_ts
 
 
@@ -73,6 +73,15 @@ def parse_litellm_err_log(since=None):
     if since:
         since_ts = since.timestamp()
 
+    # litellm err lines carry only HH:MM:SS, no date. Infer the date by
+    # walking forward through the file: when the time-of-day wraps
+    # backwards relative to the previous emitted line, the log has crossed
+    # midnight, so advance the date cursor by one day. Seed with TODAY so a
+    # same-day log still resolves correctly. This keeps cross-source sort
+    # order honest instead of stamping every line with the module-load date.
+    cur_date = now_local().date()
+    prev_hms = None
+
     ansi_pat = re.compile(r"\033\[[0-9;]*m")
     line_pat = re.compile(
         r"^(\d{2}:\d{2}:\d{2})\s*-\s*LiteLLM\s+(\S+):(\S+):\s+(.*)$"
@@ -93,7 +102,14 @@ def parse_litellm_err_log(since=None):
                     if parsed and since_ts is not None and parsed.timestamp() < since_ts:
                         continue
 
-                    full_ts = f"{TODAY}T{ts_str}+07:00"
+                    cur_hms = parsed.time() if parsed else None
+                    if prev_hms is not None and cur_hms is not None and cur_hms < prev_hms:
+                        # Time went backwards -> crossed midnight in the log file.
+                        from datetime import timedelta as _td
+                        cur_date = cur_date + _td(days=1)
+                    prev_hms = cur_hms
+
+                    full_ts = f"{cur_date}T{ts_str}+07:00"
                     entries.append(("litellm", full_ts, level, f"[{component}] {msg}"))
     except (IOError, OSError) as e:
         print(f"Warning: cannot read litellm err: {e}", file=sys.stderr)
