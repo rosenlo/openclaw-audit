@@ -72,17 +72,31 @@ def classify_entry(msg, level):
                     pass
         return cat
 
-    # Telegram send succeeded (subsystem telegram/send). High-frequency
-    # "message delivered" line — give it its own type so it stops falling
-    # through to "other". Not counted into telegram.outbound here because
-    # the legacy "message processed" line also covers outbound; counting
-    # both would double-count until we confirm they never co-occur.
-    if "telegram outbound send ok" in ml:
+    # Telegram send succeeded. Two distinct subsystems log this, with
+    # different wording and field names:
+    #   - telegram/send (queued delivery-queue sends):
+    #       "telegram outbound send ok accountId=default chatId=670530854
+    #        messageId=1956 operation=sendRichMessage deliveryKind=text ..."
+    #   - channels/telegram (direct / non-queued sends):
+    #       "telegram sendRichMessage ok chat=670530854 message=1964"
+    # These are MUTUALLY EXCLUSIVE send paths (verified 2026-06-21: across
+    # 06-20/06-21 logs the two messageId sets are disjoint — no message
+    # number appears in both), so counting both into send_ok does NOT
+    # double-count. The "message processed" line is a separate diagnostic
+    # event (almost always a cron-job timeout error, channel=cron,
+    # messageId=unknown), NOT a real reply, and is handled as telegram_out.
+    if "telegram outbound send ok" in ml or (
+        "sendrichmessage ok" in ml and "telegram" in ml
+    ):
         cat["type"] = "telegram_send_ok"
         for part in msg.split():
             if part.startswith("messageId="):
                 cat["message_id"] = part.split("=", 1)[1]
+            elif part.startswith("message="):
+                cat["message_id"] = part.split("=", 1)[1]
             elif part.startswith("chatId="):
+                cat["chat_id"] = part.split("=", 1)[1]
+            elif part.startswith("chat="):
                 cat["chat_id"] = part.split("=", 1)[1]
         return cat
 
