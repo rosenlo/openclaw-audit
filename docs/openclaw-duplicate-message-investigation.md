@@ -218,12 +218,14 @@ When there is no send evidence (`sentBeforeError === false`), `failDelivery` rem
 | Deploy to 62 | backed up original dist (`dist.bak-20260621-103602`), rsync overlay, gateway restarted cleanly (PID 8378) |
 | Startup health | heartbeat / cron / telegram provider / polling ingress all started, no errors |
 | Forensic evidence | SQLite `delivery_queue_entries` on 62 has 8 historical rows with `status=failed, recovery_state=send_attempt_started`; IDs match the logged drain events one-to-one (24c22059 / ae488190 / 838243b5 = 06-20 23:02; d3a41f6e / 5c8d150d / 560d8dff = 06-19 23:55; b78a38b2 / 6c3bdff4 = 06-16) |
-| End-to-end | pending: requires real traffic + the sporadic trigger (compaction rotation + reconnect + adapter `not_sent` misreport); background log monitor deployed |
+| End-to-end (direct-send path) | observed 2026-06-21 12:39:27: `outbound send ok messageId=1992` then `[WARN] failed to mirror ... session file changed` (session `93f749ae`, the telegram对话 compaction-successor). NO new `delivery_queue_entries` row, NO reconnect drain, NO duplicate; `task_runs.delivery_status=delivered`. This was a **non-queued direct send** (`operation=sendRichMessage`, no queueId) — mirror failure on this path does not risk drain replay because drain only scans the queue. The patch (queued path) was not exercised here. |
+| End-to-end (queued path) | pending: waiting for a mirror-fail on a QUEUED send (one that creates a `delivery_queue_entries` row); then verify `recovery_state` is `unknown_after_send`, not `send_attempt_started`. The 8 historical `send_attempt_started` rows are all pre-patch (06-16/19/20). |
 
 ### 5.5 Out of scope (not fixed by this PR)
 
 - The mirror-path `EmbeddedAttemptSessionTakeoverError` itself (compaction rotation changes inode). #89812 already makes mirror best-effort; a deeper fix would retry mirror with a re-resolved successor path, but that is independent of the drain-replay hole this PR closes.
 - The `reconcileUnknownQueuedDelivery` `not_sent` misreport itself (adapter reconciliation reliability). This PR avoids depending on it for the `send_attempt_started` case by advancing to `unknown_after_send` proactively, but does not change the adapter's reconciliation logic.
+- **Mirror failure on the non-queued direct-send path.** Not all outbound sends go through the delivery queue: direct sends (`operation=sendRichMessage` with no queueId, no `delivery_queue_entries` row) still run the transcript mirror and still log `failed to mirror ... session file changed` on fingerprint mismatch (observed 2026-06-21 12:39:27, messageId=1992). But because drain only scans `delivery_queue_entries`, a mirror failure on a non-queued send has no entry to replay -- it cannot produce a duplicate. Only the queued path risks drain replay, so only the queued path needs this fix. The direct-send path's mirror failure is purely lost transcript bookkeeping (a separate, lower-severity issue).
 
 ---
 
