@@ -479,6 +479,46 @@ def test_telegram_send_ok_classified_not_double_counted():
     assert ev["level"] == "INFO"
 
 
+def test_telegram_send_ok_new_sendrichmessage_format():
+    """The channels/telegram direct-send path logs a different wording:
+    'telegram sendRichMessage ok chat=... message=...' (no 'outbound',
+    field is 'message=' not 'messageId=', 'chat=' not 'chatId='). This
+    must also classify as telegram_send_ok so direct sends are counted.
+    Verified mutually exclusive with the queued-send path (disjoint
+    messageId sets across 06-20/06-21 logs), so no double-count risk."""
+    from openclaw_audit import analyze, classify_entry
+    msg = "telegram sendRichMessage ok chat=670530854 message=1964"
+    cat = classify_entry(msg, "INFO")
+    assert cat["type"] == "telegram_send_ok"
+    assert cat["message_id"] == "1964"
+    assert cat["chat_id"] == "670530854"
+
+    entries = [("openclaw", "2026-06-21T10:48:31.839+07:00", "INFO", msg)]
+    result = analyze(entries)
+    assert result["telegram"]["send_ok"] == 1
+    assert result["telegram"]["outbound"] == 0
+    ev = result["raw_events"][0]
+    assert ev["type"] == "📤 Telegram回复成功"
+    assert ev["detail"] == "messageId=1964"
+
+
+def test_telegram_send_ok_both_paths_counted_no_double_count():
+    """Both send paths (queued 'outbound send ok' + direct 'sendRichMessage
+    ok') emit separate lines with separate messageIds for separate sends.
+    A log containing one of each must count send_ok=2, not collapse them."""
+    from openclaw_audit import analyze
+    entries = [
+        ("openclaw", "2026-06-21T10:48:31.839+07:00", "INFO",
+         "telegram sendRichMessage ok chat=670530854 message=1964"),
+        ("openclaw", "2026-06-21T10:48:32.000+07:00", "INFO",
+         "telegram outbound send ok accountId=default chatId=670530854 "
+         "messageId=1965 operation=sendRichMessage deliveryKind=text"),
+    ]
+    result = analyze(entries)
+    assert result["telegram"]["send_ok"] == 2
+    assert result["summary"]["telegram_send_ok"] == 2
+
+
 def test_warn_no_longer_silently_dropped_after_level_fix():
     """Before the level-path fix, a generic WARN with no specific category
     landed in 'other' (empty level) and never reached raw_events. With the

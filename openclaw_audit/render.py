@@ -55,7 +55,13 @@ def print_report(result, sqlite_info, sessions_info=None):
     print()
     print(BOLD("  📊 总体指标"))
     print(f"     ├─ Telegram 消息:        {CYAN(str(s['telegram_in']))} 条")
-    print(f"     ├─ Telegram 回复:        {s['telegram_out']} 条 (send_ok: {s.get('telegram_send_ok', 0)}, 错误: {RED(str(tg_result['errors'])) if tg_result['errors'] else '0'})")
+    _send_ok = s.get("telegram_send_ok", 0)
+    # send_ok counts real Telegram replies across both send paths (queued
+    # "outbound send ok" + direct "sendRichMessage ok"). telegram_out counts
+    # the "message processed" diagnostic line, which in practice is almost
+    # always a cron-job timeout error (channel=cron), NOT a reply — so it is
+    # reported as "处理异常" rather than as replies.
+    print(f"     ├─ Telegram 回复:        {GREEN(str(_send_ok)) if _send_ok else '0'} 条 (处理异常: {RED(str(s['telegram_out'])) if s['telegram_out'] else '0'}, 发送错误: {RED(str(tg_result['errors'])) if tg_result['errors'] else '0'})")
     _tmf = s.get("transcript_mirror_failures", 0)
     print(f"     ├─ 会话记录缺失:          {YELLOW(str(_tmf)) if _tmf else GREEN('0')} 条 (送达成功但 transcript 镜像失败)")
     print(f"     ├─ LLM 调用错误:         {RED(str(s['llm_errors'])) if s['llm_errors'] else GREEN('0')} 次")
