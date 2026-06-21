@@ -13,7 +13,7 @@
 2. **Root-cause chain:** compaction rotation renames the transcript file → the outbound delivery mirror's fingerprint (inode) check throws `EmbeddedAttemptSessionTakeoverError` → the delivery entry stays in `send_attempt_started` → the next reconnect-drain replays it as "not yet sent" when the adapter's unknown-send reconciliation misreports `not_sent` → the user receives a second copy.
 3. **Related to but distinct from the [context-overflow investigation](./openclaw-context-overflow-investigation.md):** both touch the session transcript + compaction subsystem, but that one is "context too large, truncate tool results" (read path), while this one is "compaction rotation renamed the file and broke a concurrent mirror write" (write path).
 4. **Upgrade does not fix this.** npm `latest` = `2026.6.8` is the installed version. The directly relevant fix (PR #92274) is still unmerged; already-merged #89812 and #90775 are in 2026.6.8 but do not cover the rotation path.
-5. **Proposed fix (this PR):** when a required-mode batch send fails mid-batch after an earlier payload already succeeded (`OutboundDeliveryError.sentBeforeError === true`), advance the queue entry to `unknown_after_send` instead of `failDelivery`. This routes the entry through `reconcileUnknownQueuedDelivery` on drain (query the adapter for actual send state) rather than leaving it in `send_attempt_started` for blind replay.
+5. **Fix implemented and deployed.** In the fork (on `v2026.6.8` tag), `src/infra/outbound/deliver.ts`'s wrapper catch now calls `markQueuedPlatformOutcomeUnknown` (advance to `unknown_after_send`) instead of `failDelivery` when send evidence exists (`OutboundDeliveryError.sentBeforeError === true` and `platformSendStarted === true`). Without send evidence, `failDelivery` remains correct. Verified: unit tests 98/98 + negative control; built dist deployed to the 62 production gateway, healthy startup. SQLite on 62 shows 8 historical entries stuck in `recovery_state=send_attempt_started` (IDs matching the logged drain events) — direct forensic evidence of the root cause. See Section 5.
 
 ---
 
@@ -204,7 +204,20 @@ When there is no send evidence (`sentBeforeError === false`), `failDelivery` rem
 - `marks queued delivery as unknown-after-send (not failed) when a later payload fails after an earlier one succeeded` — the regression test: two payloads, first succeeds, second throws; asserts `markQueuedPlatformOutcomeUnknown` called, `failDelivery` and `ackDelivery` not called.
 - `still calls failDelivery when a payload fails before any send succeeded` — guard test: no send evidence → `failDelivery` remains correct.
 
-### 5.4 Out of scope (not fixed by this PR)
+### 5.4 Verification results (2026-06-21)
+
+| Check | Result |
+|---|---|
+| Unit tests | pass 98/98, including 2 new tests (regression + guard) |
+| Negative control | with the patch reverted, the regression test fails (`markDeliveryPlatformOutcomeUnknown` call count 0) |
+| Full build | `pnpm build` 203.7s; built dist contains the patch fingerprint (`platform-outcome-unknown after mid-send error`) |
+| Version match | fork build = `2026.6.8` = version installed on 62 |
+| Deploy to 62 | backed up original dist (`dist.bak-20260621-103602`), rsync overlay, gateway restarted cleanly (PID 8378) |
+| Startup health | heartbeat / cron / telegram provider / polling ingress all started, no errors |
+| Forensic evidence | SQLite `delivery_queue_entries` on 62 has 8 historical rows with `status=failed, recovery_state=send_attempt_started`; IDs match the logged drain events one-to-one (24c22059 / ae488190 / 838243b5 = 06-20 23:02; d3a41f6e / 5c8d150d / 560d8dff = 06-19 23:55; b78a38b2 / 6c3bdff4 = 06-16) |
+| End-to-end | pending: requires real traffic + the sporadic trigger (compaction rotation + reconnect + adapter `not_sent` misreport); background log monitor deployed |
+
+### 5.5 Out of scope (not fixed by this PR)
 
 - The mirror-path `EmbeddedAttemptSessionTakeoverError` itself (compaction rotation changes inode). #89812 already makes mirror best-effort; a deeper fix would retry mirror with a re-resolved successor path, but that is independent of the drain-replay hole this PR closes.
 - The `reconcileUnknownQueuedDelivery` `not_sent` misreport itself (adapter reconciliation reliability). This PR avoids depending on it for the `send_attempt_started` case by advancing to `unknown_after_send` proactively, but does not change the adapter's reconciliation logic.
