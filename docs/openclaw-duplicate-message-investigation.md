@@ -211,7 +211,8 @@ When there is no send evidence (`sentBeforeError === false`), `failDelivery` rem
 
 | Check | Result |
 |---|---|
-| Unit tests | pass 98/98, including 2 new tests (regression + guard) |
+| Unit tests (mocked queue) | pass 98/98, including 2 new tests (regression + guard); negative control: reverting the patch makes the regression test fail |
+| Integration tests (real SQLite queue) | pass 2/2 in `deliver.queue-integration.test.ts` — uses the real `delivery-queue` (no mock) and real `deliverOutboundPayloads` code path. Mid-batch failure with send evidence -> `recovery_state=unknown_after_send`, `retryCount=0`; no send evidence -> `failDelivery`, `recovery_state=send_attempt_started`. Negative control: reverting `deliver.ts` to v2026.6.8 original makes the mid-batch test fail with `recovery_state=send_attempt_started` (the root-cause state), proving the test exercises the patch at the real-queue layer. |
 | Negative control | with the patch reverted, the regression test fails (`markDeliveryPlatformOutcomeUnknown` call count 0) |
 | Full build | `pnpm build` 203.7s; built dist contains the patch fingerprint (`platform-outcome-unknown after mid-send error`) |
 | Version match | fork build = `2026.6.8` = version installed on 62 |
