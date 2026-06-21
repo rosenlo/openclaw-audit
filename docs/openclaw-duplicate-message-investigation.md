@@ -1,8 +1,11 @@
 # OpenClaw Duplicate Message Investigation
 
 **Date:** 2026-06-21
+
 **Environment:** OpenClaw gateway on rosen@172.27.15.62 (launchd: `ai.openclaw.gateway.plist`, port 18789), installed version `openclaw@2026.6.8`
+
 **Symptom:** The Telegram bot occasionally sends the same message twice (most recent: around 2026-06-21 00:45 (+07))
+
 **Scope:** Runtime logs (`/tmp/openclaw/openclaw-*.log`) + session transcripts (`~/.openclaw/agents/main/sessions/*.jsonl`) + openclaw dist source (`/opt/homebrew/lib/node_modules/openclaw/dist/`) + upstream repo (`github.com/openclaw/openclaw`)
 
 ---
