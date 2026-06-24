@@ -34,6 +34,8 @@ Show a wider time range:
 
 ```bash
 python3 openclaw-audit.py --since 24h
+python3 openclaw-audit.py --since today
+python3 openclaw-audit.py --since yesterday
 python3 openclaw-audit.py --since 2026-06-18
 ```
 
@@ -60,7 +62,7 @@ All paths are overrideable so the repo stays portable and does not depend on one
 | `OPENCLAW_LOG_DIR` | `/tmp/openclaw` | Directory containing `openclaw-*.log` |
 | `OPENCLAW_GATEWAY_LOG` | auto-detect | Gateway log path |
 | `LITELLM_DIR` | `~/litellm` | LiteLLM log directory |
-| `OPENCLAW_AUDIT_TZ` | `+07:00` | Audit timezone offset or `UTC` |
+| `OPENCLAW_AUDIT_TZ` | `+07:00` | Audit timezone: `+HH:MM`, `-HH:MM`, `+HHMM`, `+HH`, or `UTC` (supports half-hour offsets like `+05:30`) |
 | `OPENCLAW_NODE` | `node` | Node.js executable |
 | `OPENCLAW_CLI` | `openclaw` | OpenClaw CLI executable |
 

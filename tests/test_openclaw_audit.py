@@ -532,3 +532,290 @@ def test_warn_no_longer_silently_dropped_after_level_fix():
     ev = result["raw_events"][0]
     assert ev["level"] == "WARN"
     assert ev["type"].startswith("❌")
+
+
+# ─── parse_ts: negative tz offset + tz suffix handling (Fix #5) ────────
+def test_parse_ts_accepts_negative_offset():
+    """ISO timestamps with a negative tz offset (e.g. -05:00) must parse
+    instead of falling through to ValueError. The offset is stripped and
+    re-stamped with LOCAL_TZ (existing behavior for + offsets)."""
+    from openclaw_audit import parse_ts
+
+    dt = parse_ts("2026-06-18T07:43:06.757-05:00")
+    assert dt is not None
+    # Original wall-clock time preserved, but tzinfo replaced with LOCAL_TZ
+    assert dt.strftime("%H:%M:%S") == "07:43:06"
+
+
+def test_parse_ts_still_parses_positive_offset():
+    """Regression: positive offsets must still parse (was the only supported
+    case before the negative-offset fix)."""
+    from openclaw_audit import parse_ts
+
+    dt = parse_ts("2026-06-18T07:43:06.757+07:00")
+    assert dt is not None
+    assert dt.strftime("%H:%M:%S") == "07:43:06"
+
+
+def test_parse_ts_still_parses_z_suffix():
+    """Regression: Z (UTC) suffix must still parse."""
+    from openclaw_audit import parse_ts
+
+    dt = parse_ts("2026-06-18T07:43:06.757Z")
+    assert dt is not None
+    assert dt.strftime("%H:%M:%S") == "07:43:06"
+
+
+def test_parse_ts_naive_no_offset_uses_local_tz():
+    """Regression: a timestamp with no tz suffix is parsed and stamped
+    with LOCAL_TZ (litellm JSON logs look like this)."""
+    from openclaw_audit import parse_ts
+
+    dt = parse_ts("2026-06-18T07:43:06.757")
+    assert dt is not None
+    assert dt.tzinfo is not None  # was naive before, caused timestamp() drift
+
+
+# ─── tz_offset_str (Fix #2) ───────────────────────────────────────────
+def test_tz_offset_str_renders_local_tz():
+    """tz_offset_str must render LOCAL_TZ as ±HH:MM so LiteLLM ts strings
+    don't carry a hardcoded +07:00."""
+    from openclaw_audit.util import tz_offset_str
+    from openclaw_audit.config import LOCAL_TZ
+
+    s = tz_offset_str(LOCAL_TZ)
+    # Default LOCAL_TZ in tests is +07:00 (env not overridden)
+    assert s == "+07:00", f"expected +07:00, got {s}"
+
+
+def test_tz_offset_str_utc():
+    from openclaw_audit.util import tz_offset_str
+    from datetime import timezone
+
+    assert tz_offset_str(timezone.utc) == "+00:00"
+
+
+def test_tz_offset_str_half_hour():
+    """Half-hour tz offsets must render as ±HH:MM with minutes (not seconds).
+    Guards against a divmod-on-seconds bug that printed +05:1800 instead of
+    +05:30."""
+    from openclaw_audit.util import tz_offset_str
+    from datetime import timedelta, timezone
+
+    tz = timezone(timedelta(hours=5, minutes=30))
+    assert tz_offset_str(tz) == "+05:30"
+
+    tz_neg = timezone(timedelta(hours=-9, minutes=-30))
+    assert tz_offset_str(tz_neg) == "-09:30"
+
+
+# ─── config.parse_tz_str: half-hour / negative / UTC (Fix #6) ───────────
+def test_parse_tz_str_half_hour_offset():
+    """+05:30 (India) must parse including the 30-minute component —
+    previously int(s[:3]) dropped the minutes."""
+    from openclaw_audit.config import parse_tz_str
+    from datetime import timedelta
+
+    tz = parse_tz_str("+05:30")
+    assert tz.utcoffset(None) == timedelta(hours=5, minutes=30)
+
+
+def test_parse_tz_str_negative_offset():
+    from openclaw_audit.config import parse_tz_str
+    from datetime import timedelta
+
+    tz = parse_tz_str("-05:00")
+    assert tz.utcoffset(None) == timedelta(hours=-5)
+
+
+def test_parse_tz_str_utc_keyword():
+    from openclaw_audit.config import parse_tz_str
+    from datetime import timezone
+
+    assert parse_tz_str("UTC") == timezone.utc
+    assert parse_tz_str("utc") == timezone.utc
+
+
+def test_parse_tz_str_compact_form():
+    """+0700 (no colon) and +07 (hours only) should also parse."""
+    from openclaw_audit.config import parse_tz_str
+    from datetime import timedelta
+
+    assert parse_tz_str("+0700").utcoffset(None) == timedelta(hours=7)
+    assert parse_tz_str("+07").utcoffset(None) == timedelta(hours=7)
+
+
+def test_parse_tz_str_invalid_raises():
+    import pytest
+    from openclaw_audit.config import parse_tz_str
+
+    with pytest.raises(ValueError):
+        parse_tz_str("garbage")
+
+
+# ─── parse_since_arg: today/yesterday (Fix #3) ────────────────────────
+def test_parse_since_arg_today_does_not_raise():
+    """The bug: '--since today' used to fall into the YYYY-MM-DD else branch
+    and sys.exit(1). Now it returns today's midnight in LOCAL_TZ."""
+    from openclaw_audit.util import parse_since_arg
+
+    since, label = parse_since_arg("today")
+    assert label == "今天"
+    assert since.hour == 0 and since.minute == 0
+
+
+def test_parse_since_arg_yesterday():
+    from openclaw_audit.util import parse_since_arg
+
+    since, label = parse_since_arg("yesterday")
+    assert label == "昨天"
+    assert since.hour == 0 and since.minute == 0
+
+
+def test_parse_since_arg_default_1h():
+    from openclaw_audit.util import parse_since_arg, now_local
+    from datetime import timedelta
+
+    since, label = parse_since_arg("")
+    assert label == "最近 1 小时"
+    assert since <= now_local() - timedelta(hours=1, minutes=-1)
+
+
+def test_parse_since_arg_invalid_raises():
+    import pytest
+    from openclaw_audit.util import parse_since_arg
+
+    with pytest.raises(ValueError):
+        parse_since_arg("not-a-date")
+
+
+def test_parse_since_arg_hours_and_days():
+    from openclaw_audit.util import parse_since_arg
+
+    since_h, label_h = parse_since_arg("3h")
+    assert label_h == "最近 3 小时"
+    since_d, label_d = parse_since_arg("2d")
+    assert label_d == "最近 2 天"
+
+
+# ─── parsing mtime cache (Fix #7) ────────────────────────────────────
+def test_parsing_cache_skips_unchanged_file(tmp_path):
+    """In watch mode the same log file is re-parsed every interval. When
+    mtime and size are unchanged the cached entries must be returned
+    without re-reading the file."""
+    from openclaw_audit import parsing
+
+    log = tmp_path / "openclaw-test.log"
+    log.write_text(
+        '{"message":"hello","time":"2026-06-20T22:25:57+07:00",'
+        '"_meta":{"logLevelName":"INFO"}}\n'
+    )
+
+    parsing._FILE_CACHE.clear()
+
+    call_count = [0]
+    orig = parsing._parse_openclaw_log_raw
+
+    def counting(filepath):
+        call_count[0] += 1
+        return orig(filepath)
+
+    parsing._parse_openclaw_log_raw = counting
+    try:
+        entries1 = parsing.parse_openclaw_log(str(log))
+        assert call_count[0] == 1
+        assert len(entries1) == 1
+
+        # Second call: same mtime/size -> cache hit, raw parser NOT called.
+        entries2 = parsing.parse_openclaw_log(str(log))
+        assert call_count[0] == 1
+        assert entries1 == entries2
+    finally:
+        parsing._parse_openclaw_log_raw = orig
+
+
+def test_parsing_cache_invalidates_on_change(tmp_path):
+    """When the file's mtime/size change, the cache must miss and the file
+    must be re-parsed (otherwise watch mode would never see new log lines)."""
+    import os
+    from openclaw_audit import parsing
+
+    log = tmp_path / "openclaw-test.log"
+    log.write_text(
+        '{"message":"first","time":"2026-06-20T22:25:57+07:00",'
+        '"_meta":{"logLevelName":"INFO"}}\n'
+    )
+
+    parsing._FILE_CACHE.clear()
+    entries1 = parsing.parse_openclaw_log(str(log))
+    assert entries1[0][3] == "first"
+
+    # Modify content + bump mtime so the cache key changes.
+    log.write_text(
+        '{"message":"second","time":"2026-06-20T22:25:58+07:00",'
+        '"_meta":{"logLevelName":"INFO"}}\n'
+    )
+    new_mtime = os.path.getmtime(str(log)) + 5
+    os.utime(str(log), (new_mtime, new_mtime))
+
+    entries2 = parsing.parse_openclaw_log(str(log))
+    assert entries2[0][3] == "second"
+
+
+# ─── LiteLLM ts suffix follows LOCAL_TZ, not hardcoded +07:00 (Fix #2) ─
+def test_litellm_json_log_ts_uses_local_tz_offset(tmp_path):
+    """End-to-end: when OPENCLAW_AUDIT_TZ is overridden, the ts suffix on
+    LiteLLM JSON entries must follow LOCAL_TZ. Was hardcoded +07:00."""
+    import os
+    import subprocess
+
+    log = tmp_path / "litellm.err.log"
+    log.write_text(
+        '{"message":"x","level":"ERROR","timestamp":"2026-06-20T22:25:57.000000",'
+        '"component":"L","logger":"f.py:1"}\n'
+    )
+
+    env = os.environ.copy()
+    env["OPENCLAW_AUDIT_TZ"] = "-05:00"
+    env["LITELLM_DIR"] = str(tmp_path)
+    env["PYTHONPATH"] = str(os.path.dirname(__file__))  # so `openclaw_audit` resolves
+
+    result = subprocess.run(
+        ["python3", "-c",
+         "from openclaw_audit.parsing import parse_litellm_err_log; "
+         "print(parse_litellm_err_log()[0][1])"],
+        capture_output=True, text=True, env=env,
+        cwd=str(os.path.dirname(os.path.dirname(__file__))),
+    )
+    assert result.returncode == 0, f"stderr={result.stderr}"
+    ts = result.stdout.strip()
+    assert ts.endswith("-05:00"), f"ts suffix must follow LOCAL_TZ, got {ts}"
+
+
+def test_report_generation_time_uses_local_tz_offset(capsys, monkeypatch):
+    """The '生成时间' line in the CLI report must show the LOCAL_TZ offset,
+    not a hardcoded '+07:00'. Guards against a missed third hardcoded
+    location found during e2e verification on 172.27.15.62."""
+    import os
+    import subprocess
+    from datetime import timedelta, timezone
+
+    # Run in a subprocess so we can override OPENCLAW_AUDIT_TZ cleanly
+    # without leaking into other tests via module-level LOCAL_TZ caching.
+    code = (
+        "from openclaw_audit import analyze, print_report; "
+        "r = analyze([]); "
+        "print_report(r, {}, None)"
+    )
+    env = os.environ.copy()
+    env["OPENCLAW_AUDIT_TZ"] = "-05:00"
+    result = subprocess.run(
+        ["python3", "-c", code],
+        capture_output=True, text=True, env=env,
+        cwd=str(os.path.dirname(os.path.dirname(__file__))),
+    )
+    assert result.returncode == 0, result.stderr
+    assert "(-05:00)" in result.stdout, (
+        f"generation time must show -05:00 suffix, got: {result.stdout!r}"
+    )
+    assert "(+07:00)" not in result.stdout, "hardcoded +07:00 leaked into report"

@@ -38,32 +38,15 @@ from openclaw_audit import (
     print_report, query_sessions, query_sqlite,
 )
 from openclaw_audit.config import LOCAL_TZ
+from openclaw_audit.util import parse_since_arg
 
 
 # ─── CLI ────────────────────────────────────────────────────────────
 def cli_mode(args):
-    since = None
-    since_label = ""
-
-    if args.since:
-        if args.since.endswith("h"):
-            hours = int(args.since[:-1])
-            since = now_local() - timedelta(hours=hours)
-            since_label = f"最近 {hours} 小时"
-        elif args.since.endswith("d"):
-            days = int(args.since[:-1])
-            since = now_local() - timedelta(days=days)
-            since_label = f"最近 {days} 天"
-        else:
-            try:
-                since = datetime.strptime(args.since, "%Y-%m-%d")
-                since = since.replace(tzinfo=LOCAL_TZ)
-                since_label = since.strftime("%Y-%m-%d")
-            except ValueError:
-                print(f"Invalid --since: {args.since}"); sys.exit(1)
-    else:
-        since = now_local() - timedelta(hours=1)
-        since_label = "最近 1 小时"
+    try:
+        since, since_label = parse_since_arg(args.since)
+    except ValueError:
+        print(f"Invalid --since: {args.since}"); sys.exit(1)
 
     print(f"  分析区间:  {since_label}", file=sys.stderr)
 
@@ -102,8 +85,19 @@ def web_mode(args):
 
     app = Flask(__name__)
 
+    # Per-window data cache: since_param -> (wall_clock_s, result).
+    # Parsing + analyze + query_sessions (a 15s-timeout subprocess) on
+    # every dashboard refresh is wasteful when the user is just clicking
+    # between 1h/3h/24h tabs; a short TTL reuses the computed result.
+    _DATA_CACHE_TTL = 5.0
+    _data_cache = {}
+
     def get_data(since_param):
-        since = None
+        now = time.time()
+        cached = _data_cache.get(since_param)
+        if cached and now - cached[0] < _DATA_CACHE_TTL:
+            return cached[1]
+
         if since_param == "1h": since = now_local() - timedelta(hours=1)
         elif since_param == "3h": since = now_local() - timedelta(hours=3)
         elif since_param == "6h": since = now_local() - timedelta(hours=6)
@@ -118,6 +112,7 @@ def web_mode(args):
         entries.sort(key=lambda x: x[1])
         result = analyze(entries, since)
         result["sessions"] = query_sessions()
+        _data_cache[since_param] = (now, result)
         return result
 
     @app.route("/")
