@@ -248,8 +248,20 @@ def _write_tmp_log(lines):
 
 def test_litellm_json_log_parsed_with_real_date():
     """JSON_LOGS=true lines carry a full ISO timestamp with date+year. The
-    parser must use it directly instead of inferring from HH:MM:SS."""
+    parser must use it directly instead of inferring from HH:MM:SS. The
+    ts suffix follows LOCAL_TZ (now auto-detected from system tz by
+    default, or set via OPENCLAW_AUDIT_TZ); pin the env var so the test
+    is deterministic regardless of the host's tz."""
+    import os
     from openclaw_audit import parsing
+    # Reload config with a pinned tz so the assertion is deterministic.
+    # (Module-level LOCAL_TZ was computed at import time, so we set it
+    # back to what parsing already captured; the test only checks that
+    # parse_litellm_err_log appends tz_offset_str(LOCAL_TZ).)
+    from openclaw_audit.config import LOCAL_TZ
+    from openclaw_audit.util import tz_offset_str
+    expected_suffix = tz_offset_str(LOCAL_TZ)
+
     line = (
         '{"message": "litellm.proxy.proxy_server.user_api_key_auth(): '
         'Exception occured - No api key passed in.", "level": "ERROR", '
@@ -268,7 +280,7 @@ def test_litellm_json_log_parsed_with_real_date():
     assert len(entries) == 1
     src, ts, level, msg = entries[0]
     assert src == "litellm"
-    assert ts == "2026-06-20T22:25:57+07:00", ts
+    assert ts == f"2026-06-20T22:25:57{expected_suffix}", ts
     assert level == "ERROR"
     # auth substrings must survive into the detail so classify_litellm_entry
     # still buckets this as auth_error, not proxy_exception.
@@ -580,13 +592,26 @@ def test_parse_ts_naive_no_offset_uses_local_tz():
 # ─── tz_offset_str (Fix #2) ───────────────────────────────────────────
 def test_tz_offset_str_renders_local_tz():
     """tz_offset_str must render LOCAL_TZ as ±HH:MM so LiteLLM ts strings
-    don't carry a hardcoded +07:00."""
+    don't carry a hardcoded +07:00. LOCAL_TZ is auto-detected from the
+    system by default (or set via OPENCLAW_AUDIT_TZ), so the assertion
+    just verifies the format matches LOCAL_TZ's actual offset."""
     from openclaw_audit.util import tz_offset_str
     from openclaw_audit.config import LOCAL_TZ
 
     s = tz_offset_str(LOCAL_TZ)
-    # Default LOCAL_TZ in tests is +07:00 (env not overridden)
-    assert s == "+07:00", f"expected +07:00, got {s}"
+    # Format check: ±HH:MM with leading zeros, not +7:00 or +07:0
+    import re
+    assert re.match(r"^[+-]\d{2}:\d{2}$", s), (
+        f"expected ±HH:MM format, got {s!r}"
+    )
+    # Cross-check against LOCAL_TZ's actual offset
+    expected_offset = LOCAL_TZ.utcoffset(None)
+    if expected_offset is not None:
+        total = int(expected_offset.total_seconds())
+        sign = "+" if total >= 0 else "-"
+        h, rem = divmod(abs(total), 3600)
+        m = rem // 60
+        assert s == f"{sign}{h:02d}:{m:02d}", f"offset mismatch: {s}"
 
 
 def test_tz_offset_str_utc():
@@ -652,6 +677,119 @@ def test_parse_tz_str_invalid_raises():
 
     with pytest.raises(ValueError):
         parse_tz_str("garbage")
+
+
+# ─── Auto-detect system tz (no OPENCLAW_AUDIT_TZ) ─────────────────────
+def test_detect_system_tz_returns_timezone_with_offset():
+    """_detect_system_tz must return a tzinfo whose utcoffset is non-None
+    and matches the actual system offset (computed independently via
+    datetime.now().astimezone()). Guards against a regression where the
+    fallback path returned a naive tz."""
+    from datetime import datetime
+    from openclaw_audit.config import _detect_system_tz
+
+    tz = _detect_system_tz()
+    assert tz is not None
+    offset = tz.utcoffset(None)
+    assert offset is not None, "_detect_system_tz must return a tz with a known offset"
+    # Cross-check: the offset must equal what datetime.now().astimezone() returns
+    expected = datetime.now().astimezone().utcoffset()
+    assert offset == expected, f"detected offset {offset} != system {expected}"
+
+
+def test_local_tz_uses_env_override_when_set():
+    """When OPENCLAW_AUDIT_TZ is set, it must win over system auto-detect.
+    Runs in a subprocess so the env var doesn't leak into other tests."""
+    import os
+    import subprocess
+    import sys
+
+    code = (
+        "from openclaw_audit.config import LOCAL_TZ; "
+        "from openclaw_audit.util import tz_offset_str; "
+        "print(tz_offset_str(LOCAL_TZ))"
+    )
+    env = os.environ.copy()
+    env["OPENCLAW_AUDIT_TZ"] = "-05:00"
+    result = subprocess.run(
+        [sys.executable, "-c", code], capture_output=True, text=True, env=env,
+        cwd=str(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
+    )
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == "-05:00", (
+        f"env override should win, got {result.stdout!r}"
+    )
+
+
+def test_local_tz_auto_detects_when_env_unset():
+    """When OPENCLAW_AUDIT_TZ is NOT set, LOCAL_TZ must auto-detect from
+    the system (not fall back to a hardcoded +07:00). Runs in subprocess
+    with the env var explicitly unset."""
+    import os
+    import subprocess
+    import sys
+    from datetime import datetime
+
+    code = (
+        "from openclaw_audit.config import LOCAL_TZ; "
+        "from openclaw_audit.util import tz_offset_str; "
+        "print(tz_offset_str(LOCAL_TZ))"
+    )
+    env = os.environ.copy()
+    env.pop("OPENCLAW_AUDIT_TZ", None)
+    result = subprocess.run(
+        [sys.executable, "-c", code], capture_output=True, text=True, env=env,
+        cwd=str(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
+    )
+    assert result.returncode == 0, result.stderr
+    detected = result.stdout.strip()
+    # Must match the actual system offset (not a hardcoded +07:00).
+    expected_offset = datetime.now().astimezone().utcoffset()
+    total = int(expected_offset.total_seconds())
+    sign = "+" if total >= 0 else "-"
+    h, rem = divmod(abs(total), 3600)
+    m = rem // 60
+    expected_str = f"{sign}{h:02d}:{m:02d}"
+    assert detected == expected_str, (
+        f"auto-detected tz should match system ({expected_str}), got {detected}"
+    )
+
+
+def test_local_tz_no_hardcoded_default_when_env_unset():
+    """Specifically: with OPENCLAW_AUDIT_TZ unset, LOCAL_TZ must NOT be
+    hardcoded +07:00 unless the system actually is in +07. Guards the
+    original bug where the default was hardcoded +07:00 and a +08:00 /
+    -05:00 system would still show +07:00 in the dashboard."""
+    import os
+    import subprocess
+    import sys
+    from datetime import datetime
+
+    code = (
+        "from openclaw_audit.config import LOCAL_TZ; "
+        "from openclaw_audit.util import tz_offset_str; "
+        "print(tz_offset_str(LOCAL_TZ))"
+    )
+    env = os.environ.copy()
+    env.pop("OPENCLAW_AUDIT_TZ", None)
+    result = subprocess.run(
+        [sys.executable, "-c", code], capture_output=True, text=True, env=env,
+        cwd=str(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
+    )
+    assert result.returncode == 0, result.stderr
+    detected = result.stdout.strip()
+    system_offset = datetime.now().astimezone().utcoffset()
+    total = int(system_offset.total_seconds())
+    sign = "+" if total >= 0 else "-"
+    h, rem = divmod(abs(total), 3600)
+    m = rem // 60
+    expected = f"{sign}{h:02d}:{m:02d}"
+    # If system happens to be +07:00, the test would pass trivially; that's
+    # fine. The point is that it's not the hardcoded constant — it tracks
+    # the system tz.
+    assert detected == expected, (
+        f"LOCAL_TZ should track system tz ({expected}), got {detected!r}"
+    )
 
 
 # ─── parse_since_arg: today/yesterday (Fix #3) ────────────────────────
