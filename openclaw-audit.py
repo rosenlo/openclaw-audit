@@ -38,7 +38,7 @@ from openclaw_audit import (
     print_report, query_sessions, query_sqlite,
 )
 from openclaw_audit.config import LOCAL_TZ
-from openclaw_audit.util import parse_since_arg
+from openclaw_audit.util import parse_since_arg, tz_offset_str
 
 
 # ─── CLI ────────────────────────────────────────────────────────────
@@ -85,57 +85,126 @@ def web_mode(args):
 
     app = Flask(__name__)
 
-    # Per-window data cache: since_param -> (wall_clock_s, result).
-    # Parsing + analyze + query_sessions (a 15s-timeout subprocess) on
-    # every dashboard refresh is wasteful when the user is just clicking
-    # between 1h/3h/24h tabs; a short TTL reuses the computed result.
+    # Per-window caches: since_param -> (wall_clock_s, payload).
+    # parsing + analyze + query_sessions (a 15s-timeout subprocess) on every
+    # dashboard refresh is wasteful when the user is just clicking between
+    # 1h/3h/24h tabs; a short TTL reuses the computed payload.
     _DATA_CACHE_TTL = 5.0
     _data_cache = {}
+    _sqlite_cache = {"ts": 0.0, "value": None}
+
+    def _generated_at_str():
+        return (
+            now_local().strftime("%Y-%m-%d %H:%M:%S")
+            + " (" + tz_offset_str(LOCAL_TZ) + ")"
+        )
+
+    def _since_for_param(since_param):
+        if since_param == "1h": return now_local() - timedelta(hours=1)
+        if since_param == "3h": return now_local() - timedelta(hours=3)
+        if since_param == "6h": return now_local() - timedelta(hours=6)
+        if since_param == "24h": return now_local() - timedelta(hours=24)
+        if since_param == "today":
+            return now_local().replace(hour=0, minute=0, second=0, microsecond=0)
+        if since_param == "yesterday":
+            return now_local().replace(hour=0, minute=0, second=0, microsecond=0) - timedelta(days=1)
+        return now_local() - timedelta(hours=1)
 
     def get_data(since_param):
+        """Return (result, error_str). On error, result is None and error_str
+        is a short message for the dashboard banner. The cached payload is
+        returned by reference but must not be mutated by callers — sqlite is
+        carried separately to avoid mutating the cached result."""
         now = time.time()
         cached = _data_cache.get(since_param)
         if cached and now - cached[0] < _DATA_CACHE_TTL:
-            return cached[1]
+            return cached[1], None
 
-        if since_param == "1h": since = now_local() - timedelta(hours=1)
-        elif since_param == "3h": since = now_local() - timedelta(hours=3)
-        elif since_param == "6h": since = now_local() - timedelta(hours=6)
-        elif since_param == "24h": since = now_local() - timedelta(hours=24)
-        elif since_param == "today": since = now_local().replace(hour=0, minute=0, second=0, microsecond=0)
-        elif since_param == "yesterday": since = now_local().replace(hour=0, minute=0, second=0, microsecond=0) - timedelta(days=1)
-        else: since = now_local() - timedelta(hours=1)
+        try:
+            since = _since_for_param(since_param)
+            entries = parse_openclaw_logs_since(since)
+            litellm_entries = parse_litellm_err_log(since)
+            entries.extend(litellm_entries)
+            entries.sort(key=lambda x: x[1])
+            result = analyze(entries, since)
+            result["sessions"] = query_sessions()
+            result["_generated_at"] = _generated_at_str()
+            _data_cache[since_param] = (now, result)
+            return result, None
+        except Exception as e:
+            return None, f"{type(e).__name__}: {str(e)[:200]}"
 
-        entries = parse_openclaw_logs_since(since)
-        litellm_entries = parse_litellm_err_log(since)
-        entries.extend(litellm_entries)
-        entries.sort(key=lambda x: x[1])
-        result = analyze(entries, since)
-        result["sessions"] = query_sessions()
-        _data_cache[since_param] = (now, result)
-        return result
+    def get_sqlite():
+        """SQLite info with its own short TTL — separate from get_data so
+        sqlite reads don't force a full data recompute, and so the cached
+        result payload isn't mutated."""
+        now = time.time()
+        if _sqlite_cache["value"] is not None and now - _sqlite_cache["ts"] < _DATA_CACHE_TTL:
+            return _sqlite_cache["value"]
+        try:
+            value = query_sqlite()
+            _sqlite_cache["ts"] = now
+            _sqlite_cache["value"] = value
+            return value
+        except Exception as e:
+            return {"error": f"{type(e).__name__}: {str(e)[:200]}"}
+
+    def _build_payload(since_param):
+        """Build the full payload shared by / and /api/fragments."""
+        data, err = get_data(since_param)
+        if data is None:
+            return {"error": err, "generated_at": _generated_at_str()}
+        suggestions = [build_root_cause_summary(data)] + build_suggestions(data, data["telegram"])
+        sessions_info = data.get("sessions", {"active": []})
+        from openclaw_audit.render import render_section_fragments
+        fragments = render_section_fragments(data, suggestions, sessions_info)
+        return {
+            **fragments,
+            "generated_at": data.get("_generated_at", _generated_at_str()),
+            "error": None,
+        }
 
     @app.route("/")
     def index():
         since_param = request.args.get("since", "1h")
-        data = get_data(since_param)
-        suggestions = [build_root_cause_summary(data)] + build_suggestions(data, data["telegram"])
+        payload = _build_payload(since_param)
+        # sqlite is shown in CLI only; web keeps it in /api/data for programmatic access
+        return render_template_string(
+            HTML_TEMPLATE,
+            sel=since_param,
+            generated_at=payload["generated_at"],
+            stats_openclaw=payload.get("stats-openclaw", ""),
+            stats_litellm=payload.get("stats-litellm", ""),
+            stats_latency=payload.get("stats-latency", ""),
+            stats_sessions=payload.get("stats-sessions", ""),
+            time_series_html=payload.get("time-series", ""),
+            suggestions_html=payload.get("suggestions", ""),
+            events_html=payload.get("event-list", ""),
+        )
 
-        sqlite_info = query_sqlite()
-        data["sqlite"] = sqlite_info
-
-        return render_template_string(HTML_TEMPLATE,
-            data=data, suggestions=suggestions, sel=since_param)
+    @app.route("/api/fragments")
+    def api_fragments():
+        """Return each dashboard section as a pre-rendered HTML string, plus
+        a generated_at timestamp and error field. JS fetches this and
+        patches container innerHTML — no full page reload."""
+        since_param = request.args.get("since", "1h")
+        return jsonify(_build_payload(since_param))
 
     @app.route("/api/data")
     def api_data():
+        """Raw JSON view of the audit result + sqlite (programmatic use)."""
         since_param = request.args.get("since", "1h")
-        data = get_data(since_param)
-        data["sqlite"] = query_sqlite()
-        return jsonify(data)
+        data, err = get_data(since_param)
+        if data is None:
+            return jsonify({"error": err})
+        # Strip non-JSON-serializable fields
+        data_copy = {k: v for k, v in data.items() if k != "_generated_at"}
+        data_copy["sqlite"] = get_sqlite()
+        data_copy["generated_at"] = data.get("_generated_at", _generated_at_str())
+        return jsonify(data_copy)
 
     print(f"  Web dashboard at http://{host}:{port}")
-    app.run(host=host, port=port, debug=False)
+    app.run(host=host, port=port, debug=False, threaded=True)
 
 
 # ─── Watch模式 ──────────────────────────────────────────────────────

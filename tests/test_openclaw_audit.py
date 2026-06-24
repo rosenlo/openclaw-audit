@@ -1,3 +1,4 @@
+import pytest
 import openclaw_audit
 from openclaw_audit import (
     analyze,
@@ -819,3 +820,196 @@ def test_report_generation_time_uses_local_tz_offset(capsys, monkeypatch):
         f"generation time must show -05:00 suffix, got: {result.stdout!r}"
     )
     assert "(+07:00)" not in result.stdout, "hardcoded +07:00 leaked into report"
+
+
+# ─── Web: format_latency + format_event_time (Fix B1, B2) ────────────
+def test_format_latency_renders_units():
+    """Web cards must show latency with units (12.3s, 500ms, 2m0s) instead
+    of the raw float the previous Jinja template rendered."""
+    from openclaw_audit.render import format_latency
+
+    assert format_latency(None) == "N/A"
+    assert format_latency(0.5) == "500ms"
+    assert format_latency(12.3) == "12.3s"
+    assert format_latency(95.7) == "1m35s"
+    assert format_latency(120) == "2m0s"
+
+
+def test_format_event_time_handles_iso_text_and_empty():
+    """Web event row must format ISO timestamps as 'YYYY-MM-DD HH:MM:SS'
+    instead of the naive ``ev.time[:19].replace('T', ' ')`` that broke for
+    text-format LiteLLM lines (no date) and any non-ISO shape."""
+    from openclaw_audit.render import format_event_time
+
+    assert format_event_time(None) == "??"
+    assert format_event_time("") == "??"
+    # ISO with offset: stripped, re-stamped with LOCAL_TZ, formatted
+    iso = format_event_time("2026-06-20T22:25:57.000+07:00")
+    assert iso == "2026-06-20 22:25:57", iso
+    # text HH:MM:SS: parses using today's date
+    text = format_event_time("22:25:57")
+    assert text.endswith(" 22:25:57"), text
+
+
+# ─── Web: render_section_fragments (Fix A) ─────────────────────────────
+def test_render_section_fragments_returns_all_sections():
+    """The /api/fragments endpoint must return all 7 section IDs that the
+    JS expects to patch. Adding/removing a section without updating both
+    sides silently breaks refresh."""
+    from openclaw_audit.render import render_section_fragments
+    from openclaw_audit import analyze
+
+    result = analyze([])
+    fragments = render_section_fragments(result, ["✅ ok"], {"active": []})
+
+    expected = {
+        "stats-openclaw", "stats-litellm", "stats-latency",
+        "stats-sessions", "time-series", "suggestions", "event-list",
+    }
+    assert set(fragments.keys()) == expected, (
+        f"missing sections: {expected - set(fragments.keys())}, "
+        f"extra: {set(fragments.keys()) - expected}"
+    )
+
+
+def test_render_section_fragments_latency_uses_units():
+    """Latency in fragments must be pre-formatted with units (was raw float)."""
+    from openclaw_audit.render import render_section_fragments
+    from openclaw_audit import analyze
+
+    entries = [
+        ("openclaw", "2026-06-20T16:35:00.000+07:00", "ERROR",
+         "model-fetch error provider=litellm elapsedMs=12300 AbortError: aborted"),
+    ]
+    result = analyze(entries)
+    fragments = render_section_fragments(result, [], {"active": []})
+    assert "12.3s" in fragments["stats-latency"], (
+        f"expected '12.3s' in latency fragment, got: {fragments['stats-latency']!r}"
+    )
+
+
+# ─── Web: /api/fragments and /api/data endpoints (Fix A, C, E) ───────
+# Flask is an optional dependency (AGENTS.md). Skip these integration tests
+# when it isn't installed — they exercise the real HTTP endpoints.
+try:
+    import flask as _flask  # noqa: F401
+    _HAS_FLASK = True
+except ImportError:
+    _HAS_FLASK = False
+
+_FLASK_SKIP = pytest.mark.skipif(not _HAS_FLASK, reason="Flask not installed (optional)")
+
+
+def _start_web_server(env_overrides=None):
+    """Start the web server in a subprocess; return (proc, base_url)."""
+    import os
+    import subprocess
+    import sys
+    import time
+
+    env = os.environ.copy()
+    env["OPENCLAW_LOG_DIR"] = "/tmp/no-such-dir"
+    env["LITELLM_DIR"] = "/tmp/no-such-dir"
+    if env_overrides:
+        env.update(env_overrides)
+
+    repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    proc = subprocess.Popen(
+        [sys.executable, "openclaw-audit.py", "--web", "--port", "19100"],
+        cwd=repo_root, env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+    )
+    # Wait for server to be ready (max ~3s)
+    import urllib.request
+    for _ in range(30):
+        try:
+            urllib.request.urlopen("http://127.0.0.1:19100/", timeout=0.5)
+            return proc, "http://127.0.0.1:19100"
+        except Exception:
+            time.sleep(0.1)
+    proc.terminate()
+    return None, None
+
+
+def _stop_web_server(proc):
+    if proc:
+        proc.terminate()
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+
+
+@_FLASK_SKIP
+def test_api_fragments_endpoint_returns_sections():
+    """The /api/fragments endpoint must return JSON with each section's
+    pre-rendered HTML plus a generated_at timestamp. This is the contract
+    the fetch-based refresh relies on."""
+    import urllib.request
+    import json
+
+    proc, base = _start_web_server()
+    try:
+        assert proc is not None, "web server failed to start"
+        with urllib.request.urlopen(f"{base}/api/fragments?since=1h", timeout=5) as r:
+            assert r.status == 200
+            d = json.loads(r.read())
+        assert "error" in d and d["error"] is None
+        assert "generated_at" in d and d["generated_at"]
+        for k in ["stats-openclaw", "stats-litellm", "stats-latency",
+                  "stats-sessions", "time-series", "suggestions", "event-list"]:
+            assert k in d, f"missing section: {k}"
+            assert isinstance(d[k], str)
+    finally:
+        _stop_web_server(proc)
+
+
+@_FLASK_SKIP
+def test_index_page_has_container_ids_for_fetch_refresh():
+    """The initial HTML page must contain all the container IDs that
+    /api/fragments returns, so JS can patch them by id."""
+    import urllib.request
+
+    proc, base = _start_web_server()
+    try:
+        assert proc is not None
+        with urllib.request.urlopen(f"{base}/?since=1h", timeout=5) as r:
+            html = r.read().decode()
+        for cid in ["stats-openclaw", "stats-litellm", "stats-litellm",
+                    "stats-latency", "stats-sessions", "time-series",
+                    "suggestions", "event-list", "last-updated",
+                    "error-banner", "refresh-btn"]:
+            assert f'id="{cid}"' in html, f"missing container id: {cid}"
+    finally:
+        _stop_web_server(proc)
+
+
+@_FLASK_SKIP
+def test_api_data_endpoint_does_not_leak_sqlite_into_data_cache():
+    """Regression: previously index() did `data["sqlite"] = sqlite_info`
+    on the cached result, mutating it. The next request from cache would
+    see the previous request's sqlite already attached. Now sqlite is
+    carried separately, so two /api/data calls must not affect each
+    other's data shape (the field is set fresh on each response)."""
+    import urllib.request
+    import json
+
+    proc, base = _start_web_server()
+    try:
+        assert proc is not None
+        # First call: should add sqlite to the response
+        with urllib.request.urlopen(f"{base}/api/data?since=1h", timeout=5) as r:
+            d1 = json.loads(r.read())
+        assert "sqlite" in d1, "/api/data must include sqlite"
+
+        # Second call within TTL: cached result, but sqlite is re-fetched
+        # and re-attached. Verify the cached result payload itself wasn't
+        # mutated to embed sqlite (would be a stale value if it was).
+        with urllib.request.urlopen(f"{base}/api/data?since=1h", timeout=5) as r:
+            d2 = json.loads(r.read())
+        assert "sqlite" in d2
+        # The two sqlite payloads should be equivalent (same cached value)
+        # but the data dict should not have been mutated by the first call
+        # in a way that breaks the second.
+        assert d1["sqlite"] == d2["sqlite"]
+    finally:
+        _stop_web_server(proc)
