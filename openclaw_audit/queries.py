@@ -27,7 +27,6 @@ def _resolve_node_cli():
     if not node:
         for candidate in [
             "/opt/homebrew/bin/node",
-            "/opt/homebrew/Cellar/node@22/22.22.3/bin/node",
             "/usr/local/bin/node",
         ]:
             if os.path.exists(candidate):
@@ -123,8 +122,8 @@ def query_sqlite():
     db_info = {}
     if not os.path.exists(SQLITE_DB):
         return db_info
+    conn = sqlite3.connect(SQLITE_DB)
     try:
-        conn = sqlite3.connect(SQLITE_DB)
         cur = conn.cursor()
 
         cur.execute("""
@@ -156,8 +155,8 @@ def query_sqlite():
         ingress = cur.fetchall()
         if ingress:
             db_info["ingress"] = dict(ingress)
-
-        conn.close()
     except (sqlite3.Error, OSError) as e:
         print(f"  SQLite read error: {e}", file=sys.stderr)
+    finally:
+        conn.close()
     return db_info

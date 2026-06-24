@@ -8,13 +8,38 @@ import sys
 from collections import Counter
 from datetime import datetime, timedelta as _td
 
-from .config import LOG_DIR, LITELLM_ERR_LOG, LITELLM_OUT_LOG, now_local
-from .util import parse_ts
+from .config import LOG_DIR, LITELLM_ERR_LOG, LITELLM_OUT_LOG, LOCAL_TZ, now_local
+from .util import parse_ts, tz_offset_str
 
 
 # ─── OpenClaw 日志解析 ─────────────────────────────────────────────
+# Per-file parse cache: filepath -> (mtime_ns, size, entries).
+# In watch mode the same log files get re-parsed every interval; if mtime
+# and size are unchanged we skip re-reading and return the cached entries
+# (shallow-copied so callers can extend/sort freely). Cache is process-local
+# and only saves work within a single watch run — never persisted.
+_FILE_CACHE: dict = {}
+
+
+def _cached_parse(filepath, parser_fn):
+    try:
+        st = os.stat(filepath)
+    except OSError:
+        return []
+    cached = _FILE_CACHE.get(filepath)
+    if cached and cached[0] == st.st_mtime_ns and cached[1] == st.st_size:
+        return list(cached[2])
+    entries = parser_fn()
+    _FILE_CACHE[filepath] = (st.st_mtime_ns, st.st_size, list(entries))
+    return entries
+
+
 def parse_openclaw_log(filepath):
-    """Parse an OpenClaw JSON log file."""
+    """Parse an OpenClaw JSON log file (mtime-cached)."""
+    return _cached_parse(filepath, lambda: _parse_openclaw_log_raw(filepath))
+
+
+def _parse_openclaw_log_raw(filepath):
     entries = []
     if not os.path.exists(filepath):
         return entries
@@ -116,13 +141,19 @@ def _litellm_json_entry(obj, since_ts):
     component = obj.get("component", "LiteLLM")
     logger = obj.get("logger")  # "filename:lineno"
     detail = f"[{component}] {logger} - {msg}" if logger else f"[{component}] {msg}"
-    full_ts = parsed.strftime("%Y-%m-%dT%H:%M:%S") + "+07:00"
+    full_ts = parsed.strftime("%Y-%m-%dT%H:%M:%S") + tz_offset_str(LOCAL_TZ)
     return ("litellm", full_ts, level, detail)
 
 
 def parse_litellm_err_log(since=None):
     """Parse litellm.err.log. Supports JSON logs (JSON_LOGS=true, preferred)
-    and the legacy `HH:MM:SS - LiteLLM ...:` text format."""
+    and the legacy `HH:MM:SS - LiteLLM ...:` text format (mtime-cached)."""
+    return _cached_parse(
+        LITELLM_ERR_LOG, lambda: _parse_litellm_err_log_raw(since)
+    )
+
+
+def _parse_litellm_err_log_raw(since=None):
     entries = []
     if not os.path.exists(LITELLM_ERR_LOG):
         return entries
@@ -179,7 +210,7 @@ def parse_litellm_err_log(since=None):
                         cur_date = cur_date + _td(days=1)
                     prev_hms = cur_hms
 
-                    full_ts = f"{cur_date}T{ts_str}+07:00"
+                    full_ts = f"{cur_date}T{ts_str}{tz_offset_str(LOCAL_TZ)}"
                     entries.append(("litellm", full_ts, level, f"[{component}] {msg}"))
     except (IOError, OSError) as e:
         print(f"Warning: cannot read litellm err: {e}", file=sys.stderr)

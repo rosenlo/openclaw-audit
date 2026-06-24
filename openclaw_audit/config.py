@@ -6,6 +6,7 @@ absent a generic fallback is used.
 """
 
 import os
+import re
 from datetime import datetime, timedelta, timezone
 
 # ─── 路径配置 ───────────────────────────────────────────────────────
@@ -35,12 +36,34 @@ LITELLM_OUT_LOG = os.path.join(LITELLM_DIR, "litellm.out.log")
 LITELLM_ERR_LOG = os.path.join(LITELLM_DIR, "litellm.err.log")
 
 # ─── 时区 ───────────────────────────────────────────────────────────
-# 可通过 OPENCLAW_AUDIT_TZ 环境变量覆盖，格式: +07:00 / -05:00 / UTC
-_AUDIT_TZ_STR = os.environ.get("OPENCLAW_AUDIT_TZ", "+07:00")
-if _AUDIT_TZ_STR.upper() == "UTC":
-    LOCAL_TZ = timezone.utc
-else:
-    LOCAL_TZ = timezone(timedelta(hours=int(_AUDIT_TZ_STR[:3])))
+# 可通过 OPENCLAW_AUDIT_TZ 环境变量覆盖，格式: +07:00 / -05:00 / +05:30 / UTC
+# （也接受 +0700 / +07 这种简写）。
+_AUDIT_TZ_STR = os.environ.get("OPENCLAW_AUDIT_TZ", "+07:00").strip()
+
+
+def parse_tz_str(s):
+    """Parse a tz string into a ``timezone`` object.
+
+    Accepts ``UTC`` (case-insensitive), ``+HH:MM``, ``-HH:MM``, ``+HHMM``,
+    or ``+HH`` (including half-hour offsets like ``+05:30``). Raises
+    ``ValueError`` on a malformed input so callers can surface a clear error
+    instead of silently falling back.
+    """
+    if s.strip().upper() == "UTC":
+        return timezone.utc
+    m = re.match(r"^([+-]?)(\d{1,2}):?(\d{2})?$", s.strip())
+    if not m:
+        raise ValueError(
+            f"Invalid OPENCLAW_AUDIT_TZ: {s!r} "
+            "(expected +HH:MM, -HH:MM, +HHMM, +HH, or UTC)"
+        )
+    sign = -1 if m.group(1) == "-" else 1
+    hours = int(m.group(2))
+    minutes = int(m.group(3) or 0)
+    return timezone(timedelta(minutes=sign * (hours * 60 + minutes)))
+
+
+LOCAL_TZ = parse_tz_str(_AUDIT_TZ_STR)
 
 
 def now_local():

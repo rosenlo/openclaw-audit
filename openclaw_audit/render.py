@@ -1,10 +1,10 @@
 """Rendering: CLI text report and the web dashboard HTML template."""
 
-from .config import now_local
+from .config import LOCAL_TZ, now_local
 from .insights import build_root_cause_summary, build_suggestions
 from .util import (
     BOLD, CYAN, DIM, GREEN, RED, YELLOW,
-    _session_id_from_key, fmt_duration, parse_ts,
+    _session_id_from_key, fmt_duration, parse_ts, tz_offset_str,
 )
 
 
@@ -17,7 +17,7 @@ def print_report(result, sqlite_info, sessions_info=None):
     print(BOLD("═" * 60))
     print(BOLD("      OpenClaw 调用链路审计报告"))
     print(BOLD("═" * 60))
-    print(f"  生成时间:  {now_local().strftime('%Y-%m-%d %H:%M:%S')} (+07:00)")
+    print(f"  生成时间:  {now_local().strftime('%Y-%m-%d %H:%M:%S')} ({tz_offset_str(LOCAL_TZ)})")
     print(f"  数据来源:  OpenClaw日志 + Litellm日志")
 
     # ── Health Score ──

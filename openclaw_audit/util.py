@@ -2,39 +2,85 @@
 
 import re
 import sys
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
-from .config import LOCAL_TZ, TODAY
+from .config import LOCAL_TZ, TODAY, now_local
+
+
+def tz_offset_str(tz):
+    """Render a tzinfo as ±HH:MM (UTC -> +00:00).
+
+    Used wherever we re-stamp a LiteLLM timestamp string with the audit's
+    local tz so the rendered suffix matches ``LOCAL_TZ`` instead of a
+    hardcoded ``+07:00`` that breaks when ``OPENCLAW_AUDIT_TZ`` is overridden.
+    """
+    if tz is None:
+        return ""
+    offset = tz.utcoffset(None)
+    if offset is None:
+        return ""
+    total = int(offset.total_seconds())
+    sign = "+" if total >= 0 else "-"
+    abs_total = abs(total)
+    h, rem = divmod(abs_total, 3600)
+    m = rem // 60
+    return f"{sign}{h:02d}:{m:02d}"
+
+
+def parse_since_arg(since_str):
+    """Parse the ``--since`` CLI flag.
+
+    Accepts ``Nh`` (hours), ``Nd`` (days), ``today``, ``yesterday``, or a
+    ``YYYY-MM-DD`` date. Returns ``(since_datetime, label)`` where ``since``
+    is tz-aware in ``LOCAL_TZ`` and ``label`` is the human string the CLI
+    prints. Raises ``ValueError`` on a bad format so the caller can surface
+    ``Invalid --since``. Empty/None falls back to "最近 1 小时" so callers
+    don't have to special-case the default.
+    """
+    if not since_str:
+        since = now_local() - timedelta(hours=1)
+        return since, "最近 1 小时"
+    s = since_str.lower()
+    if s == "today":
+        return now_local().replace(hour=0, minute=0, second=0, microsecond=0), "今天"
+    if s == "yesterday":
+        return (
+            now_local().replace(hour=0, minute=0, second=0, microsecond=0) - timedelta(days=1),
+            "昨天",
+        )
+    if since_str.endswith("h"):
+        hours = int(since_str[:-1])
+        return now_local() - timedelta(hours=hours), f"最近 {hours} 小时"
+    if since_str.endswith("d"):
+        days = int(since_str[:-1])
+        return now_local() - timedelta(days=days), f"最近 {days} 天"
+    dt = datetime.strptime(since_str, "%Y-%m-%d").replace(tzinfo=LOCAL_TZ)
+    return dt, dt.strftime("%Y-%m-%d")
 
 
 def parse_ts(ts_str):
-    """Parse OpenClaw ISO timestamp or litellm HH:MM:SS timestamp."""
+    """Parse OpenClaw ISO timestamp or litellm HH:MM:SS timestamp.
+
+    Accepts ``±HH:MM`` offsets (and ``Z``) on ISO input. The original tz
+    suffix is stripped and replaced with ``LOCAL_TZ`` because OpenClaw/litellm
+    logs are produced on the same machine the audit runs on, so trusting the
+    wall clock + local tz matches reality. Returns ``None`` on parse failure.
+    """
     if not ts_str:
         return None
     try:
-        # OpenClaw format: 2026-06-18T07:43:06.757+07:00
+        # OpenClaw / litellm ISO: 2026-06-18T07:43:06.757+07:00, ...Z, or
+        # no tz at all. Strip any trailing offset and re-stamp with LOCAL_TZ.
         if "T" in ts_str or " " in ts_str:
-            if "+" in ts_str:
-                ts_clean = ts_str.rsplit("+", 1)[0]
-                fmt = "%Y-%m-%dT%H:%M:%S.%f" if "." in ts_clean else "%Y-%m-%dT%H:%M:%S"
-                dt = datetime.strptime(ts_clean, fmt)
-                dt = dt.replace(tzinfo=LOCAL_TZ)
-                return dt.astimezone(LOCAL_TZ)
-            elif "Z" in ts_str:
-                ts_clean = ts_str.replace("Z", "")
-                fmt = "%Y-%m-%dT%H:%M:%S.%f" if "." in ts_clean else "%Y-%m-%dT%H:%M:%S"
-                dt = datetime.strptime(ts_clean, fmt)
-                dt = dt.replace(tzinfo=timezone.utc)
-                return dt.astimezone(LOCAL_TZ)
-            else:
-                fmt = "%Y-%m-%dT%H:%M:%S.%f" if "." in ts_str else "%Y-%m-%dT%H:%M:%S"
-                return datetime.strptime(ts_str, fmt)
+            ts_clean = re.sub(r"(Z|[+-]\d{2}:\d{2})$", "", ts_str)
+            fmt = "%Y-%m-%dT%H:%M:%S.%f" if "." in ts_clean else "%Y-%m-%dT%H:%M:%S"
+            dt = datetime.strptime(ts_clean, fmt)
+            return dt.replace(tzinfo=LOCAL_TZ)
         # litellm format: HH:MM:SS
         elif re.match(r"^\d{2}:\d{2}:\d{2}", ts_str):
             today_str = TODAY
             dt = datetime.strptime(f"{today_str} {ts_str}", "%Y-%m-%d %H:%M:%S")
-            dt = dt.replace(tzinfo=LOCAL_TZ)
-            return dt
+            return dt.replace(tzinfo=LOCAL_TZ)
     except (ValueError, IndexError):
         return None
     return None
