@@ -36,9 +36,11 @@ LITELLM_OUT_LOG = os.path.join(LITELLM_DIR, "litellm.out.log")
 LITELLM_ERR_LOG = os.path.join(LITELLM_DIR, "litellm.err.log")
 
 # ─── 时区 ───────────────────────────────────────────────────────────
-# 可通过 OPENCLAW_AUDIT_TZ 环境变量覆盖，格式: +07:00 / -05:00 / +05:30 / UTC
-# （也接受 +0700 / +07 这种简写）。
-_AUDIT_TZ_STR = os.environ.get("OPENCLAW_AUDIT_TZ", "+07:00").strip()
+# 优先级:
+#   1) OPENCLAW_AUDIT_TZ 显式覆盖 (+07:00 / -05:00 / +05:30 / +0700 / +07 / UTC)
+#   2) 自动从系统本地时区探测 (datetime.now().astimezone().tzinfo)
+# 这样默认就不写死 +07:00, 在不同机器跑都跟系统时区走; 想固定覆盖再设 env。
+_AUDIT_TZ_STR = os.environ.get("OPENCLAW_AUDIT_TZ", "").strip()
 
 
 def parse_tz_str(s):
@@ -63,7 +65,31 @@ def parse_tz_str(s):
     return timezone(timedelta(minutes=sign * (hours * 60 + minutes)))
 
 
-LOCAL_TZ = parse_tz_str(_AUDIT_TZ_STR)
+def _detect_system_tz():
+    """Detect the system local timezone via the stdlib.
+
+    ``datetime.now().astimezone()`` with no tzinfo argument attaches the
+    system local timezone (reads /etc/localtime on POSIX, the OS tz on
+    Windows). Returns a ``timezone`` (fixed offset) object. Falls back to
+    UTC only if detection returns a naive datetime (shouldn't happen on
+    any supported platform, but guards against containers with no tzdata).
+    """
+    try:
+        dt = datetime.now().astimezone()
+        if dt.tzinfo is not None:
+            # Re-construct as a fixed-offset timezone so utcoffset() is
+            # stable and tz_offset_str renders cleanly (some platforms
+            # return a DstTzInfo whose utcoffset() depends on the datetime).
+            return timezone(dt.utcoffset())
+    except (OverflowError, OSError):
+        pass
+    return timezone.utc
+
+
+if _AUDIT_TZ_STR:
+    LOCAL_TZ = parse_tz_str(_AUDIT_TZ_STR)
+else:
+    LOCAL_TZ = _detect_system_tz()
 
 
 def now_local():

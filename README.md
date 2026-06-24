@@ -62,7 +62,7 @@ All paths are overrideable so the repo stays portable and does not depend on one
 | `OPENCLAW_LOG_DIR` | `/tmp/openclaw` | Directory containing `openclaw-*.log` |
 | `OPENCLAW_GATEWAY_LOG` | auto-detect | Gateway log path |
 | `LITELLM_DIR` | `~/litellm` | LiteLLM log directory |
-| `OPENCLAW_AUDIT_TZ` | `+07:00` | Audit timezone: `+HH:MM`, `-HH:MM`, `+HHMM`, `+HH`, or `UTC` (supports half-hour offsets like `+05:30`) |
+| `OPENCLAW_AUDIT_TZ` | auto-detect from system | Audit timezone override: `+HH:MM`, `-HH:MM`, `+HHMM`, `+HH`, or `UTC` (supports half-hour offsets like `+05:30`). When unset, the audit follows the system local timezone (via `datetime.now().astimezone()`), so the dashboard "最后更新" / report "生成时间" suffix matches the host's actual tz instead of a hardcoded value. |
 | `OPENCLAW_NODE` | `node` | Node.js executable |
 | `OPENCLAW_CLI` | `openclaw` | OpenClaw CLI executable |
 
