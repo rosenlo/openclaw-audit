@@ -141,9 +141,25 @@ def classify_entry(msg, level):
                     "lastProgress",
                     "lastProgressAge",
                     "recovery",
+                    "toolName",
                 ],
             )
         )
+        # Derive a short tool name when the stall is on a tool_call. For
+        # model_call, OpenClaw emits lastProgress as 'model_call:started'
+        # (kind:state, no name to surface). For tool_call it carries the
+        # tool name, e.g. 'tool_call:Bash:started' or 'tool_call:Bash'.
+        # Surface just the name so the audit detail points at the
+        # offending tool without the operator having to read the raw
+        # progress string. If the segment is a bare state word (no name
+        # emitted), leave `tool` unset and let the display fall back to
+        # showing lastProgress verbatim.
+        lp = cat.get("lastProgress", "")
+        if lp.startswith("tool_call:"):
+            rest = lp[len("tool_call:"):]
+            head = rest.split(":", 1)[0] if ":" in rest else rest
+            if head and head not in {"started", "completed", "pending", "running"}:
+                cat["tool"] = head
         return cat
 
     if "context overflow" in ml or "context-overflow" in ml:

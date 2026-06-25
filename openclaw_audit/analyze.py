@@ -106,14 +106,23 @@ def analyze(entries, since=None):
                 result["stalls"] += 1
                 detail_parts = [
                     f"reason={cat.get('reason','?')}",
-                    f"classification={cat.get('classification','?')}",
                     f"state={cat.get('state','?')}",
                     f"age={cat.get('age','?')}",
                     f"lastProgressAge={cat.get('lastProgressAge','?')}",
                     f"queueDepth={cat.get('queueDepth','?')}",
                 ]
+                if cat.get("classification"):
+                    detail_parts.append(f"classification={cat['classification']}")
                 if cat.get("activeWorkKind"):
                     detail_parts.append(f"activeWorkKind={cat['activeWorkKind']}")
+                if cat.get("tool"):
+                    detail_parts.append(f"tool={cat['tool']}")
+                elif cat.get("lastProgress"):
+                    detail_parts.append(f"lastProgress={cat['lastProgress']}")
+                if cat.get("recovery"):
+                    detail_parts.append(f"recovery={cat['recovery']}")
+                if cat.get("sessionKey"):
+                    detail_parts.append(f"sessionKey={cat['sessionKey']}")
                 result["raw_events"].append({
                     "source": "openclaw", "time": ts_str, "type": "⏸ 卡住会话",
                     "detail": " ".join(detail_parts),

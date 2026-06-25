@@ -24,6 +24,96 @@ def test_classify_entry_detects_stalled_session():
     assert cat["classification"] == "stalled_agent_run"
     assert cat["state"] == "processing"
     assert cat["lastProgressAge"] == "122s"
+    # model_call stalls carry no tool name — `tool` must NOT be set so
+    # the display falls back to showing lastProgress verbatim.
+    assert "tool" not in cat
+
+
+def test_classify_entry_stalled_tool_call_extracts_tool_name():
+    """When a session stalls on a tool_call, OpenClaw emits lastProgress
+    as 'tool_call:<name>:<state>' (or 'tool_call:<name>'). The classifier
+    must surface the tool name as `tool` so the audit detail points at
+    the offending tool without the operator reading the raw progress
+    string."""
+    msg = (
+        "stalled session: sessionId=abc state=processing age=1704s "
+        "queueDepth=0 reason=blocked_tool_call classification=blocked_tool_call "
+        "activeWorkKind=tool_call lastProgress=tool_call:Bash:started "
+        "lastProgressAge=195s"
+    )
+
+    cat = classify_entry(msg, "ERROR")
+
+    assert cat["type"] == "stalled_session"
+    assert cat["reason"] == "blocked_tool_call"
+    assert cat["activeWorkKind"] == "tool_call"
+    assert cat["tool"] == "Bash"
+    assert cat["lastProgress"] == "tool_call:Bash:started"
+
+
+def test_classify_entry_stalled_tool_call_no_state_suffix():
+    """lastProgress may be 'tool_call:<name>' with no trailing :<state>.
+    The tool name must still be extracted."""
+    msg = (
+        "stalled session: state=processing reason=blocked_tool_call "
+        "activeWorkKind=tool_call lastProgress=tool_call:Read"
+    )
+    cat = classify_entry(msg, "ERROR")
+    assert cat["tool"] == "Read"
+
+
+def test_classify_entry_stalled_tool_call_bare_state_no_tool():
+    """If OpenClaw emits 'tool_call:started' (bare state, no tool name),
+    we must NOT mislabel 'started' as the tool name. `tool` stays unset
+    and the display falls back to showing lastProgress verbatim."""
+    msg = (
+        "stalled session: state=processing reason=blocked_tool_call "
+        "activeWorkKind=tool_call lastProgress=tool_call:started"
+    )
+    cat = classify_entry(msg, "ERROR")
+    assert "tool" not in cat
+    assert cat["lastProgress"] == "tool_call:started"
+
+
+def test_analyze_stalled_tool_call_detail_shows_tool_name():
+    """The audit detail for a blocked_tool_call stall must surface
+    `tool=<name>` so triage can immediately see which tool hung, instead
+    of having to read lastProgress raw."""
+    from openclaw_audit import analyze
+    msg = (
+        "stalled session: sessionId=abc "
+        "sessionKey=agent:main:telegram:direct:670530854 state=processing "
+        "age=1704s queueDepth=0 reason=blocked_tool_call "
+        "classification=blocked_tool_call activeWorkKind=tool_call "
+        "lastProgress=tool_call:Bash:started lastProgressAge=195s"
+    )
+    result = analyze([("openclaw", "2026-06-25T18:02:08+07:00", "ERROR", msg)])
+    ev = result["raw_events"][0]
+    assert "tool=Bash" in ev["detail"]
+    # lastProgress should NOT also be shown when tool= is present (avoids
+    # repeating the same info twice in the detail line).
+    assert "lastProgress=" not in ev["detail"]
+    assert "reason=blocked_tool_call" in ev["detail"]
+    assert "activeWorkKind=tool_call" in ev["detail"]
+    assert "sessionKey=agent:main:telegram:direct:670530854" in ev["detail"]
+
+
+def test_analyze_stalled_model_call_detail_falls_back_to_lastProgress():
+    """For a model_call stall (no tool name to extract), the detail must
+    show lastProgress verbatim so the operator still sees the runner
+    state, instead of an empty gap where tool= would have been."""
+    from openclaw_audit import analyze
+    msg = (
+        "stalled session: sessionId=bbb state=processing age=122s "
+        "queueDepth=1 reason=active_work_without_progress "
+        "classification=stalled_agent_run activeWorkKind=model_call "
+        "lastProgress=model_call:started lastProgressAge=122s recovery=none"
+    )
+    result = analyze([("openclaw", "2026-06-20T16:34:56+07:00", "WARN", msg)])
+    ev = result["raw_events"][0]
+    assert "lastProgress=model_call:started" in ev["detail"]
+    assert "tool=" not in ev["detail"]
+    assert "recovery=none" in ev["detail"]
 
 
 def test_classify_entry_marks_llm_abort():
