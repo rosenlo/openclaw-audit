@@ -466,6 +466,92 @@ def test_transcript_mirror_failed_classified_and_counted():
     assert ev["level"] == "WARN"
 
 
+def test_takeover_error_silent_gap_classified_and_counted():
+    """The 'lane task error: ... EmbeddedAttemptSessionTakeoverError: ...' ERROR
+    must get its own category because it produces a silent transcript gap —
+    the mirror call is never reached, so the regular `transcript_mirror_failed`
+    WARN does NOT fire. Without this classifier the gap would be buried as
+    generic ERROR noise."""
+    from openclaw_audit import analyze, classify_entry
+    msg = (
+        'lane task error: lane=session:agent:main:telegram:direct:670530854 '
+        'durationMs=91506 error="EmbeddedAttemptSessionTakeoverError: session '
+        'file changed while embedded prompt lock was released: '
+        '/Users/rosen/.openclaw/agents/main/sessions/x.jsonl"'
+    )
+    cat = classify_entry(msg, "ERROR")
+    assert cat["type"] == "takeover_error_silent_gap"
+
+    entries = [("openclaw", "2026-06-26T16:29:09.279+08:00", "ERROR", msg)]
+    result = analyze(entries)
+    assert result["takeover_silent_gaps"] == 1
+    assert result["summary"]["takeover_silent_gaps"] == 1
+    ev = result["raw_events"][0]
+    assert ev["type"] == "🔇 静默会话记录缺失"
+    assert ev["level"] == "ERROR"
+
+    # Ensure the regular transcript_mirror_failed path still works and is
+    # NOT double-counted as a silent gap (the WARN message contains
+    # "EmbeddedAttemptSessionTakeoverError" inside its `reason` string but
+    # must classify as transcript_mirror_failed, not takeover_error_silent_gap).
+    warn_msg = (
+        "failed to mirror outbound delivery into session transcript; "
+        "channel send already succeeded: session file changed while embedded "
+        "prompt lock was released: /Users/rosen/.openclaw/agents/main/sessions/x.jsonl"
+    )
+    warn_cat = classify_entry(warn_msg, "WARN")
+    assert warn_cat["type"] == "transcript_mirror_failed"
+
+
+def test_truncate_helper_marks_truncation():
+    """`_truncate` must append an ellipsis when the input exceeds the limit
+    so a clipped path/error message is not mistaken for the full string.
+    Inputs at or below the limit pass through unchanged."""
+    from openclaw_audit import _truncate
+
+    assert _truncate("short", 10) == "short"
+    assert _truncate("exactly10", 10) == "exactly10"
+    # 11 chars truncated to 10 leaves room for the 1-char marker (9 head + 1 marker).
+    out = _truncate("elevenchars", 10)
+    assert len(out) == 10
+    assert out.endswith("…")
+    assert out.startswith("elevencha")  # original 9-char head preserved
+    # Custom marker is honored.
+    out2 = _truncate("elevenchars", 10, marker="...")
+    assert out2.endswith("...")
+    assert len(out2) == 10
+    # None passes through unchanged.
+    assert _truncate(None, 10) is None
+
+
+def test_analyze_preserves_long_error_detail_with_ellipsis():
+    """Long log messages used to be cut at 200 chars with no marker, hiding
+    the tail (file paths, provider names, error chains). The detail must now
+    retain ~400 chars and end with an ellipsis when clipped. Pick a generic
+    WARN that falls through to the `other` branch (which uses _truncate on
+    the raw msg) rather than a classifier that emits a fixed detail string."""
+    from openclaw_audit import analyze
+
+    long_msg = (
+        "[plugins] plugins.allow is empty; discovered non-bundled plugins may "
+        "auto-load: codex (/Users/rosen/.openclaw/npm/projects/openclaw-codex"
+        "-8902d781d4/node_modules/@openclaw/codex/dist/index.js). Set "
+        "plugins.allow to explicit trusted ids. "
+        + "x" * 250
+        + " tail_that_must_survive=1"
+    )
+    # Sanity: the message is over the 400-char ceiling so truncation kicks in.
+    assert len(long_msg) > 400
+    entries = [("openclaw", "2026-06-26T08:39:38.442+08:00", "WARN", long_msg)]
+    result = analyze(entries)
+    # Find the raw_event that carries this message's detail.
+    matching = [ev for ev in result["raw_events"] if "plugins.allow" in ev.get("detail", "")]
+    assert matching, "expected at least one raw_event carrying the long plugins WARN"
+    detail = matching[0]["detail"]
+    assert len(detail) <= 400, "detail must not exceed the 400-char ceiling"
+    assert detail.endswith("…"), "clipped detail must end with the ellipsis marker"
+
+
 def test_telegram_send_ok_classified_not_double_counted():
     """'telegram outbound send ok' is the high-frequency delivery line. It
     must get its own type and show in events, but NOT increment
