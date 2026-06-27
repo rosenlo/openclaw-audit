@@ -255,6 +255,57 @@ def classify_entry(msg, level):
         cat["type"] = "agent_end"
         return cat
 
+    # long-running session: openclaw emits this every ~5 min for sessions
+    # stuck in state=processing. Distinct from stalled_session (which is
+    # openclaw's own classification) — long-running is the early warning
+    # before stalled_session fires.
+    if "long-running session" in ml:
+        cat["type"] = "long_running_session"
+        cat.update(
+            _extract_fields(
+                msg,
+                [
+                    "sessionId",
+                    "sessionKey",
+                    "state",
+                    "age",
+                    "queueDepth",
+                    "reason",
+                    "classification",
+                    "activeWorkKind",
+                    "lastProgress",
+                    "lastProgressAge",
+                    "recovery",
+                ],
+            )
+        )
+        return cat
+
+    # Subagent announce give-up: the child finished, but the parent
+    # never received the result because the retry-limit was hit. This is
+    # the "wedged parent" event — the parent will park in state=processing
+    # indefinitely. The exact log line is:
+    #   "Subagent announce give up (retry-limit) run=... child=...
+    #    requester=... retries=N ... deliveryError=..."
+    if "announce give up" in ml or "announce give-up" in ml:
+        cat["type"] = "announce_giveup"
+        cat.update(
+            _extract_fields(
+                msg,
+                ["run", "child", "requester", "retries", "endedAgo", "deliveryError"],
+            )
+        )
+        return cat
+
+    # source_reply_delivery_mode_mismatch: the parent session's delivery
+    # state machine desynced from the subagent's completion — the parent
+    # will never receive the result. Pairs with announce_giveup but is
+    # emitted on a different code path (requester wake failure).
+    if "source_reply_delivery_mode_mismatch" in ml:
+        cat["type"] = "delivery_mode_mismatch"
+        cat.update(_extract_fields(msg, ["sessionId", "gatewayHealth"]))
+        return cat
+
     if level in ("ERROR", "WARN", "FATAL"):
         cat["type"] = "unknown_error"
         cat["level"] = level

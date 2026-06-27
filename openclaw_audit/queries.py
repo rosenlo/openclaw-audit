@@ -59,7 +59,7 @@ def _resolve_node_cli():
 
 
 def query_sessions():
-    """Query active sessions via openclaw CLI for context usage."""
+    """Query active sessions via openclaw CLI for context usage and state."""
     sessions_info = {"active": []}
     try:
         import subprocess
@@ -110,6 +110,14 @@ def query_sessions():
                 "sessionId": _session_id_from_key(s.get("key", "")),
                 "updatedAt": s.get("updatedAt"),
                 "clientUpdatedAt": _fmt_ts(s.get("updatedAt")),
+                # ── State markers (new): surface what the session is doing
+                # right now, not just token usage. These come straight from
+                # `openclaw sessions --json` and are interpreted by the
+                # render layer into status badges / suggestions.
+                "abortedLastRun": bool(s.get("abortedLastRun")),
+                "systemSent": bool(s.get("systemSent")),
+                "tokensFresh": s.get("totalTokensFresh"),
+                "ageMs": s.get("ageMs"),
             }
             sessions_info["active"].append(entry)
     except (FileNotFoundError, subprocess.TimeoutExpired, json.JSONDecodeError, OSError) as e:
@@ -126,37 +134,153 @@ def query_sqlite():
     try:
         cur = conn.cursor()
 
-        cur.execute("""
-            SELECT count(*), printf('%.1f', avg((ended_at-started_at)/1000.0)),
-                   printf('%.1f', max((ended_at-started_at)/1000.0))
-            FROM subagent_runs
-            WHERE started_at IS NOT NULL AND ended_at IS NOT NULL
-        """)
-        row = cur.fetchone()
-        if row and row[0] > 0:
-            db_info["subagent_count"] = row[0]
-            db_info["subagent_avg_dur"] = float(row[1])
-            db_info["subagent_max_dur"] = float(row[2])
+        # Each section is independently try-guarded: a missing column or
+        # table on an older OpenClaw install must not block later sections
+        # (subagent_runs schema, task_runs, diagnostic_events all evolved
+        # over versions). The outer try only catches the truly unexpected.
 
-        cur.execute("SELECT status, count(*) FROM flow_runs GROUP BY status")
-        flows = cur.fetchall()
-        if flows:
-            db_info["flows"] = dict(flows)
+        try:
+            cur.execute("""
+                SELECT count(*), printf('%.1f', avg((ended_at-started_at)/1000.0)),
+                       printf('%.1f', max((ended_at-started_at)/1000.0))
+                FROM subagent_runs
+                WHERE started_at IS NOT NULL AND ended_at IS NOT NULL
+            """)
+            row = cur.fetchone()
+            if row and row[0] > 0:
+                db_info["subagent_count"] = row[0]
+                db_info["subagent_avg_dur"] = float(row[1])
+                db_info["subagent_max_dur"] = float(row[2])
+        except sqlite3.Error:
+            pass
 
-        cur.execute("SELECT count(*), status FROM task_runs GROUP BY status")
-        tasks = cur.fetchall()
-        if tasks:
-            db_info["tasks"] = {r[1]: r[0] for r in tasks}
+        try:
+            cur.execute("SELECT status, count(*) FROM flow_runs GROUP BY status")
+            flows = cur.fetchall()
+            if flows:
+                db_info["flows"] = dict(flows)
+        except sqlite3.Error:
+            pass
 
-        cur.execute("""
-            SELECT status, count(*) FROM channel_ingress_events
-            WHERE channel_id = 'telegram' GROUP BY status
-        """)
-        ingress = cur.fetchall()
-        if ingress:
-            db_info["ingress"] = dict(ingress)
+        try:
+            cur.execute("SELECT count(*), status FROM task_runs GROUP BY status")
+            tasks = cur.fetchall()
+            if tasks:
+                db_info["tasks"] = {r[1]: r[0] for r in tasks}
+        except sqlite3.Error:
+            pass
+
+        try:
+            cur.execute("""
+                SELECT status, count(*) FROM channel_ingress_events
+                WHERE channel_id = 'telegram' GROUP BY status
+            """)
+            ingress = cur.fetchall()
+            if ingress:
+                db_info["ingress"] = dict(ingress)
+        except sqlite3.Error:
+            pass
+
+        # ── Recent failed/lost task_runs: surface the error text so the
+        # operator can see FailoverError / "No API key" / "Codex
+        # subscription usage limit" without reading raw logs. Cap at 5
+        # rows so the report stays readable; each row is (status, err,
+        # age_min, task_label).
+        try:
+            cur.execute("""
+                SELECT status, error,
+                       (strftime('%s','now') - ended_at/1000.0) / 60.0,
+                       label
+                FROM task_runs
+                WHERE status IN ('failed', 'lost') AND ended_at IS NOT NULL
+                ORDER BY ended_at DESC LIMIT 5
+            """)
+            rows = cur.fetchall()
+            if rows:
+                db_info["recent_task_failures"] = [
+                    {
+                        "status": r[0],
+                        "error": _truncate_sql_text(r[1], 200),
+                        "age_min": round(r[2], 1) if r[2] is not None else None,
+                        "label": _truncate_sql_text(r[3], 80),
+                    }
+                    for r in rows
+                ]
+        except sqlite3.Error:
+            # schema drift on older installs — task_runs may not have
+            # these columns or the table may be absent entirely.
+            pass
+
+        # ── subagent_runs announce give-up: surface runs whose last
+        # announce delivery failed. These are the "wedged parent" events
+        # — the child completed but the parent never received the result
+        # because the announce retry-limit was hit.
+        try:
+            cur.execute("""
+                SELECT substr(run_id, 1, 8),
+                       last_announce_delivery_error,
+                       announce_retry_count,
+                       ended_reason,
+                       (strftime('%s','now') - ended_at/1000.0) / 60.0
+                FROM subagent_runs
+                WHERE last_announce_delivery_error IS NOT NULL
+                  AND last_announce_delivery_error != ''
+                  AND ended_at IS NOT NULL
+                ORDER BY ended_at DESC LIMIT 5
+            """)
+            rows = cur.fetchall()
+            if rows:
+                db_info["recent_announce_failures"] = [
+                    {
+                        "run_id": r[0],
+                        "error": _truncate_sql_text(r[1], 200),
+                        "retries": r[2],
+                        "ended_reason": r[3],
+                        "age_min": round(r[4], 1) if r[4] is not None else None,
+                    }
+                    for r in rows
+                ]
+        except sqlite3.Error:
+            pass
+
+        # ── diagnostic_events: long-running / stalled session warnings.
+        # openclaw emits these every ~5 minutes for sessions stuck in
+        # state=processing. Each (scope, event_key) is upserted, so we
+        # only get the latest snapshot per key — still useful to spot
+        # currently-stuck sessions at audit time.
+        try:
+            cur.execute("""
+                SELECT scope, event_key, payload_json,
+                       (strftime('%s','now') - created_at/1000.0) / 60.0
+                FROM diagnostic_events
+                WHERE created_at > strftime('%s','now') * 1000 - 3600 * 1000
+                ORDER BY created_at DESC LIMIT 10
+            """)
+            rows = cur.fetchall()
+            if rows:
+                db_info["recent_diagnostics"] = [
+                    {
+                        "scope": r[0],
+                        "event_key": r[1],
+                        "payload": _truncate_sql_text(r[2], 200),
+                        "age_min": round(r[3], 1) if r[3] is not None else None,
+                    }
+                    for r in rows
+                ]
+        except sqlite3.Error:
+            pass
     except (sqlite3.Error, OSError) as e:
         print(f"  SQLite read error: {e}", file=sys.stderr)
     finally:
         conn.close()
     return db_info
+
+
+def _truncate_sql_text(s, n=200):
+    """Truncate a SQLite text field for display. None → empty string."""
+    if s is None:
+        return ""
+    s = str(s)
+    if len(s) <= n:
+        return s
+    return s[: n - 1] + "…"

@@ -130,9 +130,10 @@ def render_stats_sessions(sessions_info):
         has_tok = sess.get("hasTokens", False)
         pct = sess.get("usagePct")
         sess_failed = sess.get("isFailed", False)
+        badge = _session_status_badge(sess)
         if sess_failed:
             cls = "bad"
-            value = "FAILED"
+            value = f"FAILED {badge}"
             sub = "❌ 子会话已失败"
         elif has_tok:
             if pct < 50:
@@ -141,17 +142,43 @@ def render_stats_sessions(sessions_info):
                 cls = "warn"
             else:
                 cls = "bad"
-            value = f"{pct:.0f}%"
+            value = f"{pct:.0f}% {badge}"
             sub = f'{sess["totalTokens"]:,}/{sess["contextTokens"]:,}'
         else:
             cls = ""
-            value = "N/A"
+            value = f"N/A {badge}"
             sub = f'N/A/{sess.get("contextTokens", 0):,}'
         label = (f'{sess["kind"]} ({sess["model"]}) '
                  f'<span style="color:#565f89;font-weight:normal">@{sess.get("clientUpdatedAt") or "??"}</span> '
                  f'<span style="color:#565f89;font-weight:normal">id:{sess.get("sessionId") or sess.get("key", "")}</span>')
         cards.append(_card(label, value, sub, cls))
     return "".join(cards)
+
+
+def _session_status_badge(sess):
+    """Compute a short status badge from session state markers.
+
+    Returns a plain-text tag (no ANSI/HTML) so it renders in both the CLI
+    report and the web dashboard. Logic:
+
+    - abortedLastRun → '⚠ aborted' (last run was aborted, may need attention)
+    - totalTokensFresh is False → '⊘ stale' (token data is not current)
+    - ageMs > 3600_000 (1h) and kind=direct → '💤 idle' (long idle)
+    - kind=direct and ageMs < 60_000 (1m) → '⚙ active' (currently running)
+    - otherwise → '' (omit badge; default healthy state)
+    """
+    if sess.get("abortedLastRun"):
+        return "⚠ aborted"
+    if sess.get("tokensFresh") is False:
+        return "⊘ stale"
+    age_ms = sess.get("ageMs")
+    kind = sess.get("kind", "")
+    if isinstance(age_ms, (int, float)):
+        if age_ms > 3600 * 1000 and kind == "direct":
+            return "💤 idle"
+        if age_ms < 60 * 1000 and kind == "direct":
+            return "⚙ active"
+    return ""
 
 
 def render_time_series(time_series):
@@ -346,25 +373,77 @@ def print_report(result, sqlite_info, sessions_info=None):
             print(f"     └─ Flow状态:        {sqlite_info['flows']}")
         if "ingress" in sqlite_info:
             print(f"     └─ Telegram入口:    {sqlite_info['ingress']}")
+        if "tasks" in sqlite_info:
+            tasks_str = ", ".join(f"{k}: {v}" for k, v in sorted(sqlite_info["tasks"].items()))
+            print(f"     └─ Task状态:        {tasks_str}")
+
+        # Recent task_run failures — surface the error text directly so
+        # the operator sees "FailoverError: No API key" / "Codex
+        # subscription usage limit" without reading raw logs.
+        recent_fails = sqlite_info.get("recent_task_failures") or []
+        if recent_fails:
+            print()
+            print(BOLD(f"  ❌ 最近失败的 Task (top {len(recent_fails)})"))
+            for r in recent_fails:
+                age = r.get("age_min")
+                age_str = f"{age:.0f}分钟前" if age is not None else "?"
+                err = r.get("error") or "(no error text)"
+                label = r.get("label") or ""
+                label_str = f" [{label}]" if label else ""
+                print(f"     {RED('✗')} {age_str} {r['status']}{label_str}")
+                print(f"       {DIM(err)}")
+
+        # Recent subagent announce give-ups — the "wedged parent" events.
+        ann_fails = sqlite_info.get("recent_announce_failures") or []
+        if ann_fails:
+            print()
+            print(BOLD(f"  ⚠️  Announce give-up (wedged parent) (top {len(ann_fails)})"))
+            for r in ann_fails:
+                age = r.get("age_min")
+                age_str = f"{age:.0f}分钟前" if age is not None else "?"
+                err = r.get("error") or "(no error text)"
+                retries = r.get("retries")
+                reason = r.get("ended_reason") or "?"
+                print(f"     {YELLOW('!')} {age_str} run {r.get('run_id','?')} "
+                      f"retries={retries} reason={reason}")
+                print(f"       {DIM(err)}")
+
+        # Recent diagnostic_events — long-running / stalled session warnings.
+        diags = sqlite_info.get("recent_diagnostics") or []
+        if diags:
+            print()
+            print(BOLD(f"  🔬 诊断事件 (top {len(diags)})"))
+            for r in diags:
+                age = r.get("age_min")
+                age_str = f"{age:.0f}分钟前" if age is not None else "?"
+                payload = r.get("payload") or ""
+                print(f"     {YELLOW('!')} {age_str} [{r.get('scope','?')}] "
+                      f"{r.get('event_key','?')}")
+                print(f"       {DIM(payload)}")
 
     # ── Session 上下文用量 ──
     if sessions_info and sessions_info.get("active"):
         print()
-        print(BOLD("  💬 Session 上下文用量"))
+        print(BOLD("  💬 Session 上下文用量 + 状态"))
         for sess in sessions_info["active"]:
             pct = sess.get("usagePct")
             has_tokens = sess.get("hasTokens", False)
-            status = sess.get("status", "unknown")
             kind = sess["kind"]
             model = sess["model"]
             updated_display = sess.get("clientUpdatedAt", "")
             timestamp_tag = f" {DIM(chr(64) + updated_display)}" if updated_display else ""
             sess_id = sess.get("sessionId", "") or _session_id_from_key(sess.get("key", ""))
+
+            # Status badge from state markers (abortedLastRun, tokensFresh,
+            # ageMs). Computed before token display so the badge precedes
+            # the percentage bar.
+            badge = _session_status_badge(sess)
+
             # 失败会话优先标记
             if sess.get("isFailed"):
-                print(f"     [{kind:8}] {RED('❌ FAILED')} {'—'} {sess.get('totalTokens', '?')}/{sess['contextTokens']:,} {model}{timestamp_tag}  {DIM(f'id:{sess_id}')}")
+                print(f"     [{kind:8}] {RED('❌ FAILED')} {badge} {'—'} {sess.get('totalTokens', '?')}/{sess['contextTokens']:,} {model}{timestamp_tag}  {DIM(f'id:{sess_id}')}")
             elif not has_tokens:
-                print(f"     [{kind:8}] {'N/A':>5} {'—'} {sess.get('totalTokens', '?')}/{sess['contextTokens']:,} {model}{timestamp_tag}  {DIM(f'id:{sess_id}')}")
+                print(f"     [{kind:8}] {'N/A':>5} {badge} {'—'} {sess.get('totalTokens', '?')}/{sess['contextTokens']:,} {model}{timestamp_tag}  {DIM(f'id:{sess_id}')}")
             else:
                 pct_val = pct or 0
                 bar_len = int(pct_val / 100 * 25)
@@ -372,7 +451,7 @@ def print_report(result, sqlite_info, sessions_info=None):
                 color_f = GREEN if pct_val < 50 else (YELLOW if pct_val < 80 else RED)
                 total_display = f"{sess['totalTokens']:,}"
                 ctx_display = f"{sess['contextTokens']:,}"
-                print(f"     [{kind:8}] {color_f(f'{pct_val:5.1f}%')} {bar} {total_display}/{ctx_display} {model}{timestamp_tag}  {DIM(f'id:{sess_id}')}")
+                print(f"     [{kind:8}] {color_f(f'{pct_val:5.1f}%')} {bar} {badge} {total_display}/{ctx_display} {model}{timestamp_tag}  {DIM(f'id:{sess_id}')}")
 
     # ── 关键事件 ──
     events = result.get("raw_events", [])

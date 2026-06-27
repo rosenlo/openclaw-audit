@@ -20,7 +20,7 @@ def build_suggestions(result, tg_result=None):
     if l.get("auth_errors", 0) > 0:
         suggestions.append("⚪ LiteLLM 鉴权失败 — 通常是本机 /models 探测请求未带 key（No api key passed），不影响聊天链路；若非本机请求再查 API key 配置")
     if l.get("proxy_exceptions", 0) > 0:
-        suggestions.append("🔴 LiteLLM 代理异常 — 先查 LitellM / proxy 日志")
+        suggestions.append("🔴 LiteLLM 代理异常 — 先查 LitelLM / proxy 日志")
     if l.get("upstream_timeouts", 0) > 0:
         suggestions.append("🔴 LiteLLM 上游超时 — 上游响应慢或超时")
     if s["llm_timeouts"] >= 3:
@@ -41,9 +41,106 @@ def build_suggestions(result, tg_result=None):
         suggestions.append("🔴 Telegram 回复失败 — 需关注消息发送链路")
     if l.get("warnings", 0) > 0:
         suggestions.append("🟡 Litellm 配置警告 — 将 set_verbose 改为 LITELLM_LOG=DEBUG")
+    suggestions.extend(_sqlite_failure_suggestions(result.get("sqlite_info") or {}))
+    suggestions.extend(_session_state_suggestions(result.get("sessions_info") or {}))
     if not suggestions:
         suggestions.append("✅ 系统运行正常")
     return suggestions
+
+
+def _sqlite_failure_suggestions(sqlite_info):
+    """Turn recent task_run / subagent announce failures into suggestions.
+
+    These come from query_sqlite() reading the live SQLite state. We only
+    surface failures from the last 60 minutes so the suggestion list stays
+    focused on the current window, not historical errors.
+    """
+    out = []
+    recents = sqlite_info.get("recent_task_failures") or []
+    recent_count = sum(1 for r in recents if (r.get("age_min") or 0) <= 60)
+    if recent_count > 0:
+        # Pick the most common error text (case-folded) among recent
+        # failures so the suggestion points at the dominant cause, not a
+        # random one.
+        recent = [r for r in recents if (r.get("age_min") or 0) <= 60]
+        err_counts = {}
+        for r in recent:
+            err = r.get("error") or ""
+            key = err[:80].lower()
+            err_counts[key] = (err_counts.get(key, [0, err])[0] + 1, err)
+        top_key = max(err_counts, key=lambda k: err_counts[k][0])
+        top_err = err_counts[top_key][1]
+        if "no api key" in top_err.lower():
+            out.append(
+                f"🔴 子Agent启动失败 {recent_count} 次 (近1h) — FailoverError: "
+                f"openai provider 缺 API key。检查 `openclaw agents add main` "
+                f"或 agent 的 auth store（/Users/rosen/.openclaw/agents/main/agent/openclaw-agent.sqlite）"
+            )
+        elif "codex subscription usage limit" in top_err.lower():
+            reset_match = ""
+            for r in recent:
+                if "reset" in (r.get("error") or "").lower():
+                    reset_match = " — " + r["error"]
+                    break
+            out.append(
+                f"🔴 子Agent失败 {recent_count} 次 (近1h) — Codex 订阅用量到顶"
+                f"{reset_match[:120]}"
+            )
+        else:
+            out.append(
+                f"🔴 子Agent失败 {recent_count} 次 (近1h) — {top_err[:120]}"
+            )
+    ann_failures = sqlite_info.get("recent_announce_failures") or []
+    ann_recent = [r for r in ann_failures if (r.get("age_min") or 0) <= 60]
+    if ann_recent:
+        out.append(
+            f"🔴 Announce give-up {len(ann_recent)} 次 (近1h) — 子Agent 完成但结果"
+            f"未送达主 session (parent 可能 wedged)。最近: "
+            f"{ann_recent[0].get('error','')[:100]}"
+        )
+    return out
+
+
+def _session_state_suggestions(sessions_info):
+    """Suggest /compact or /new based on context window usage and session
+    state markers (abortedLastRun, idle age, stale tokens).
+
+    Thresholds:
+      - usagePct >= 80% → suggest /new (close to overflow, /compact too late)
+      - 60% <= usagePct < 80% → suggest /compact (still room, but trim)
+      - abortedLastRun on a direct session → suggest checking last run
+      - kind=direct and idle_min < 5 → no suggestion (currently active)
+    """
+    out = []
+    sessions = sessions_info.get("active") or []
+    for sess in sessions:
+        # Only suggest for direct (top-level) sessions — subagents are
+        # short-lived and their context is reclaimed by the parent.
+        if sess.get("kind") != "direct":
+            continue
+        pct = sess.get("usagePct")
+        if pct is None:
+            # No token data (session has no successful run yet, or
+            # totalTokensFresh=False). Surface abortedLastRun if present.
+            if sess.get("abortedLastRun"):
+                sid = sess.get("sessionId", "")[:8]
+                out.append(
+                    f"🟠 主会话 {sid} 上次 run 被 abort — 检查 task_runs.error "
+                    f"看是否 FailoverError / 订阅限额;可考虑 /new 重置"
+                )
+            continue
+        sid = sess.get("sessionId", "")[:8]
+        if pct >= 80:
+            out.append(
+                f"🔴 主会话 {sid} 上下文 {pct:.0f}% 已满 — 建议立即 /new "
+                f"开新 session;否则下一轮大概率触发 compaction / context overflow"
+            )
+        elif pct >= 60:
+            out.append(
+                f"🟡 主会话 {sid} 上下文 {pct:.0f}% — 建议 /compact 压缩历史, "
+                f"避免接近窗口上限时被强制 compaction (可能丢上下文)"
+            )
+    return out
 
 
 def build_root_cause_summary(result):
