@@ -22,8 +22,13 @@ Environment Variables:
 
 LiteLLM 日志格式:
   推荐 LiteLLM 进程设 JSON_LOGS=true，让 err.log 每行一个 JSON 对象、
-  timestamp 带完整日期年份 (LITELLM_LOG=DEBUG 控制级别)。本工具同时兼容
-  老的 HH:MM:SS 文本格式。注意是 JSON_LOGS，不是 LITELLM_LOG=JSON。
+  timestamp 带完整日期年份 (LITELLM_LOG=DEBUG 控制级别)。本工具只解析
+  JSON 行;老的 HH:MM:SS 文本格式行会被跳过 (没有日期,会让历史事件
+  漂移到未来)。注意是 JSON_LOGS，不是 LITELLM_LOG=JSON。
+
+  launchd 不轮转 err.log/out.log,本工具启动时按 LITELLM_LOG_MAX_SIZE_BYTES
+  (默认 50MB) 自动 copytruncate 轮转,保留 LITELLM_LOG_KEEP (默认 5) 份。
+  也可用 --rotate-litellm-logs 手动触发。
 """
 
 import argparse
@@ -34,15 +39,28 @@ from datetime import datetime, timedelta
 
 from openclaw_audit import (
     HTML_TEMPLATE, analyze, build_root_cause_summary, build_suggestions,
-    now_local, parse_litellm_err_log, parse_openclaw_logs_since,
+    maybe_rotate_litellm_logs, now_local,
+    parse_litellm_err_log, parse_openclaw_logs_since,
     print_report, query_sessions, query_sqlite,
+    rotate_litellm_logs,
 )
 from openclaw_audit.config import LOCAL_TZ
 from openclaw_audit.util import parse_since_arg, tz_offset_str
 
 
+def _run_startup_rotation():
+    """Rotate litellm logs if they exceed the size threshold. Called once
+    at CLI/web/watch startup so the log files don't grow unbounded
+    (launchd redirects litellm stdout/stderr but never rotates them)."""
+    results = maybe_rotate_litellm_logs()
+    for path, r in results.items():
+        if r["rotated"]:
+            print(f"  ♻️  轮转 {os.path.basename(path)}: {r['reason']}", file=sys.stderr)
+
+
 # ─── CLI ────────────────────────────────────────────────────────────
 def cli_mode(args):
+    _run_startup_rotation()
     try:
         since, since_label = parse_since_arg(args.since)
     except ValueError:
@@ -74,6 +92,7 @@ def cli_mode(args):
 
 # ─── Web ────────────────────────────────────────────────────────────
 def web_mode(args):
+    _run_startup_rotation()
     port = args.port or 9090
     host = args.host or "127.0.0.1"
 
@@ -209,6 +228,7 @@ def web_mode(args):
 
 # ─── Watch模式 ──────────────────────────────────────────────────────
 def watch_mode(args):
+    _run_startup_rotation()
     from openclaw_audit.util import DIM
 
     interval = args.interval or 30
@@ -231,6 +251,17 @@ def watch_mode(args):
 
 
 # ─── 入口 ────────────────────────────────────────────────────────────
+def rotate_mode(args):
+    """Force-rotate litellm logs and exit."""
+    results = rotate_litellm_logs()
+    for path, r in results.items():
+        basename = os.path.basename(path)
+        if r["rotated"]:
+            print(f"  ♻️  轮转 {basename}: {r['reason']}")
+        else:
+            print(f"  ⏭️  跳过 {basename}: {r['reason']}")
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="OpenClaw + LiteLLM Audit Tool",
@@ -242,6 +273,7 @@ Examples:
   python3 %(prog)s --since today            # 今天
   python3 %(prog)s --web                    # Web Dashboard
   python3 %(prog)s --watch                  # 持续观察
+  python3 %(prog)s --rotate-litellm-logs    # 手动轮转 litellm 日志
         """)
     parser.add_argument("--since", default="", help="1h, 3h, 6h, 24h, today, YYYY-MM-DD (default: 1h)")
     parser.add_argument("--web", action="store_true", help="Web Dashboard")
@@ -250,10 +282,16 @@ Examples:
     parser.add_argument("--watch", action="store_true", help="Watch mode")
     parser.add_argument("--interval", type=int, default=30, help="Watch interval (default: 30)")
     parser.add_argument("--hours", type=int, default=1, help="Watch window (default: 1)")
+    parser.add_argument(
+        "--rotate-litellm-logs", action="store_true",
+        help="Force-rotate litellm err/out logs (copytruncate) and exit",
+    )
 
     args = parser.parse_args()
 
-    if args.web:
+    if args.rotate_litellm_logs:
+        rotate_mode(args)
+    elif args.web:
         web_mode(args)
     elif args.watch:
         watch_mode(args)

@@ -185,6 +185,7 @@ def test_package_exports_public_api():
         "analyze", "classify_entry", "classify_litellm_entry",
         "build_suggestions", "build_root_cause_summary",
         "parse_openclaw_logs_since", "parse_litellm_err_log",
+        "maybe_rotate_litellm_logs", "rotate_litellm_logs",
         "query_sessions", "query_sqlite", "print_report",
         "HTML_TEMPLATE", "now_local",
     ]:
@@ -247,16 +248,23 @@ def test_analyze_detail_not_truncated_short():
     assert not detail.endswith("No api key pa")
 
 
-def test_litellm_err_log_date_inference_across_midnight():
-    """litellm err lines have only HH:MM:SS. When the time wraps backwards
-    the parser must advance the inferred date by one day, so a 23:59 -> 00:01
-    sequence is stamped on consecutive days (not both on 'today')."""
+def test_litellm_err_log_skips_text_format_lines():
+    """Legacy `HH:MM:SS - LiteLLM ...:` text-format lines carry no date
+    and were previously mis-stamped as 'today', drifting historical events
+    into the future. The parser must skip them entirely — only JSON lines
+    (JSON_LOGS=true) with a full timestamp are parsed."""
     import tempfile, os
     from openclaw_audit import parsing
 
     lines = [
-        "23:59:58 - LiteLLM Router:ERROR: late-night error\n",
-        "00:01:05 - LiteLLM Router:ERROR: after-midnight error\n",
+        # legacy text line, no date — must be skipped
+        "22:25:03 - LiteLLM Router:ERROR: auth_exception_handler.py:97 - "
+        "No api key passed in.\n",
+        # JSON line with real date — must parse
+        '{"message": "litellm.proxy.proxy_server.user_api_key_auth(): '
+        'Exception occured - No api key passed in.", "level": "ERROR", '
+        '"timestamp": "2026-06-20T22:25:57.000000", '
+        '"component": "LiteLLM Proxy", "logger": "auth_exception_handler.py:97"}\n',
     ]
     with tempfile.NamedTemporaryFile("w", suffix=".log", delete=False) as tf:
         tf.writelines(lines)
@@ -269,23 +277,27 @@ def test_litellm_err_log_date_inference_across_midnight():
         parsing.LITELLM_ERR_LOG = orig
         os.unlink(path)
 
-    assert len(entries) == 2
-    d1 = entries[0][1].split("T")[0]
-    d2 = entries[1][1].split("T")[0]
-    # second line is the next calendar day relative to the first
-    assert d2 > d1, f"expected date to advance across midnight: {d1} -> {d2}"
+    # Only the JSON line must be parsed; the text line skipped.
+    assert len(entries) == 1
+    src, ts, level, msg = entries[0]
+    assert src == "litellm"
+    assert ts.startswith("2026-06-20T22:25:57")
+    assert "No api key passed" in msg
 
 
-def test_litellm_err_log_same_day_no_spurious_advance():
-    """A normal increasing-time sequence within one day must NOT advance the
-    date — guards against the cursor over-rotating on same-day logs."""
+def test_litellm_err_log_ignores_ansi_text_lines():
+    """litellm's launchd-redirected stderr can contain ANSI-coloured text
+    lines from its early startup (before JSON_LOGS applies). These must
+    not be silently mis-stamped — they must be skipped."""
     import tempfile, os
     from openclaw_audit import parsing
 
     lines = [
-        "10:00:00 - LiteLLM Router:ERROR: first\n",
-        "10:05:00 - LiteLLM Router:ERROR: second\n",
-        "10:10:00 - LiteLLM Router:ERROR: third\n",
+        "\033[92m22:25:57 - LiteLLM Proxy:ERROR\033[0m: "
+        "auth_exception_handler.py:97 - No api key passed in.\n",
+        '{"message": "ok", "level": "INFO", '
+        '"timestamp": "2026-06-20T22:30:00.000000", '
+        '"component": "LiteLLM", "logger": "utils.py:1"}\n',
     ]
     with tempfile.NamedTemporaryFile("w", suffix=".log", delete=False) as tf:
         tf.writelines(lines)
@@ -298,8 +310,8 @@ def test_litellm_err_log_same_day_no_spurious_advance():
         parsing.LITELLM_ERR_LOG = orig
         os.unlink(path)
 
-    dates = {e[1].split("T")[0] for e in entries}
-    assert len(dates) == 1, f"all same-day lines should share one date, got {dates}"
+    assert len(entries) == 1
+    assert entries[0][3] == "[LiteLLM] utils.py:1 - ok"
 
 
 def test_cli_event_list_shows_full_date_with_year(capsys):
@@ -403,12 +415,12 @@ def test_litellm_json_log_classifies_as_auth_error():
     assert result["raw_events"][0]["type"] == "🔑 Litellm鉴权失败"
 
 
-def test_litellm_json_and_text_lines_coexist():
-    """A file may contain both JSON lines and legacy text lines (e.g. during
-    a config flip). Both must parse, each with its own correct date."""
+def test_litellm_json_and_text_lines_only_json_parsed():
+    """A file may contain both JSON lines and legacy text lines (e.g. from
+    a config flip mid-run). Only JSON lines must parse; text lines skipped."""
     from openclaw_audit import parsing
     lines = [
-        # legacy text line, same day
+        # legacy text line, same day — must be skipped
         "22:25:03 - LiteLLM Router:ERROR: auth_exception_handler.py:97 - "
         "No api key passed in.\n",
         # JSON line a bit later
@@ -425,64 +437,146 @@ def test_litellm_json_and_text_lines_coexist():
         parsing.LITELLM_ERR_LOG = orig
         import os; os.unlink(path)
 
-    assert len(entries) == 2
-    # JSON entry keeps its own real date; text entry keeps today's date.
-    dates = {e[1].split("T")[0] for e in entries}
-    assert "2026-06-20" in dates
+    assert len(entries) == 1
+    # JSON entry keeps its own real date.
+    assert entries[0][1].startswith("2026-06-20T22:40:07")
 
 
-def test_litellm_text_same_day_reorder_not_misread_as_midnight():
-    """The original bug: text lines 22:25:53 followed by 22:22:24 (a small
-    backwards step from same-day reordering) were misread as a midnight
-    crossing and stamped on the next day, floating them above later events
-    in the sort. With the 12h threshold, the small backstep must NOT advance
-    the date."""
+# ─── LiteLLM log rotation ─────────────────────────────────────────
+
+
+def test_rotate_litellm_logs_copytruncate():
+    """rotate_litellm_logs must copy the current file to .1 and truncate
+    the original in place, so the litellm process's open fd stays valid."""
+    import tempfile, os
     from openclaw_audit import parsing
-    lines = [
-        "22:25:53 - LiteLLM Router:ERROR: auth_exception_handler.py:97 - "
-        "No api key passed in.\n",
-        "22:22:24 - LiteLLM Router:ERROR: auth_exception_handler.py:97 - "
-        "No api key passed in.\n",
-        "22:42:22 - LiteLLM Router:ERROR: auth_exception_handler.py:97 - "
-        "No api key passed in.\n",
-    ]
-    path = _write_tmp_log(lines)
-    try:
-        orig = parsing.LITELLM_ERR_LOG
-        parsing.LITELLM_ERR_LOG = path
-        entries = parsing.parse_litellm_err_log(since=None)
-    finally:
-        parsing.LITELLM_ERR_LOG = orig
-        import os; os.unlink(path)
 
-    assert len(entries) == 3
-    # All three must share one date — none promoted to "tomorrow".
-    dates = {e[1].split("T")[0] for e in entries}
-    assert len(dates) == 1, f"same-day reorder should not split dates, got {dates}"
+    with tempfile.TemporaryDirectory() as tmpdir:
+        err_path = os.path.join(tmpdir, "litellm.err.log")
+        with open(err_path, "w") as f:
+            f.write("line1\nline2\n")
+        orig_err = parsing.LITELLM_ERR_LOG
+        orig_out = parsing.LITELLM_OUT_LOG
+        parsing.LITELLM_ERR_LOG = err_path
+        parsing.LITELLM_OUT_LOG = os.path.join(tmpdir, "litellm.out.log")
+        try:
+            results = parsing.rotate_litellm_logs(keep=3)
+        finally:
+            parsing.LITELLM_ERR_LOG = orig_err
+            parsing.LITELLM_OUT_LOG = orig_out
+
+        assert results[err_path]["rotated"] is True
+        assert os.path.exists(f"{err_path}.1")
+        with open(f"{err_path}.1") as f:
+            assert f.read() == "line1\nline2\n"
+        with open(err_path) as f:
+            assert f.read() == ""
 
 
-def test_litellm_text_real_midnight_still_advances():
-    """A genuine midnight crossing (23:59 -> 00:01) is a large backstep and
-    must still advance the date by one day. Guards the threshold against
-    being so strict it breaks real cross-midnight logs."""
+def test_rotate_shifts_existing_backups():
+    """rotate must shift .1 -> .2, .2 -> .3, ..., and drop files beyond
+    keep, so the backup count stays bounded."""
+    import tempfile, os
     from openclaw_audit import parsing
-    lines = [
-        "23:59:58 - LiteLLM Router:ERROR: late-night error\n",
-        "00:01:05 - LiteLLM Router:ERROR: after-midnight error\n",
-    ]
-    path = _write_tmp_log(lines)
-    try:
-        orig = parsing.LITELLM_ERR_LOG
-        parsing.LITELLM_ERR_LOG = path
-        entries = parsing.parse_litellm_err_log(since=None)
-    finally:
-        parsing.LITELLM_ERR_LOG = orig
-        import os; os.unlink(path)
 
-    assert len(entries) == 2
-    d1 = entries[0][1].split("T")[0]
-    d2 = entries[1][1].split("T")[0]
-    assert d2 > d1, f"expected date to advance across midnight: {d1} -> {d2}"
+    with tempfile.TemporaryDirectory() as tmpdir:
+        err_path = os.path.join(tmpdir, "litellm.err.log")
+        with open(err_path, "w") as f:
+            f.write("current\n")
+        # pre-existing backups
+        for i, content in enumerate([".1 content", ".2 content", ".3 content"], start=1):
+            with open(f"{err_path}.{i}", "w") as f:
+                f.write(content)
+        orig_err = parsing.LITELLM_ERR_LOG
+        orig_out = parsing.LITELLM_OUT_LOG
+        parsing.LITELLM_ERR_LOG = err_path
+        parsing.LITELLM_OUT_LOG = os.path.join(tmpdir, "litellm.out.log")
+        try:
+            results = parsing.rotate_litellm_logs(keep=3)
+        finally:
+            parsing.LITELLM_ERR_LOG = orig_err
+            parsing.LITELLM_OUT_LOG = orig_out
+
+        assert results[err_path]["rotated"] is True
+        # .3 dropped (beyond keep), .2 -> .3, .1 -> .2, current -> .1
+        assert not os.path.exists(f"{err_path}.4")
+        with open(f"{err_path}.1") as f:
+            assert f.read() == "current\n"
+        with open(f"{err_path}.2") as f:
+            assert f.read() == ".1 content"
+        with open(f"{err_path}.3") as f:
+            assert f.read() == ".2 content"
+
+
+def test_maybe_rotate_skips_small_files():
+    """maybe_rotate_litellm_logs must skip files below the size threshold."""
+    import tempfile, os
+    from openclaw_audit import parsing
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        err_path = os.path.join(tmpdir, "litellm.err.log")
+        with open(err_path, "w") as f:
+            f.write("small\n")
+        orig_err = parsing.LITELLM_ERR_LOG
+        orig_out = parsing.LITELLM_OUT_LOG
+        parsing.LITELLM_ERR_LOG = err_path
+        parsing.LITELLM_OUT_LOG = os.path.join(tmpdir, "litellm.out.log")
+        try:
+            results = parsing.maybe_rotate_litellm_logs(max_size_bytes=1024)
+        finally:
+            parsing.LITELLM_ERR_LOG = orig_err
+            parsing.LITELLM_OUT_LOG = orig_out
+
+        assert results[err_path]["rotated"] is False
+        assert "size=" in results[err_path]["reason"]
+        # original file untouched
+        with open(err_path) as f:
+            assert f.read() == "small\n"
+
+
+def test_maybe_rotate_triggers_on_oversize():
+    """maybe_rotate_litellm_logs must rotate when file >= threshold."""
+    import tempfile, os
+    from openclaw_audit import parsing
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        err_path = os.path.join(tmpdir, "litellm.err.log")
+        with open(err_path, "w") as f:
+            f.write("x" * 200)
+        orig_err = parsing.LITELLM_ERR_LOG
+        orig_out = parsing.LITELLM_OUT_LOG
+        parsing.LITELLM_ERR_LOG = err_path
+        parsing.LITELLM_OUT_LOG = os.path.join(tmpdir, "litellm.out.log")
+        try:
+            results = parsing.maybe_rotate_litellm_logs(max_size_bytes=100)
+        finally:
+            parsing.LITELLM_ERR_LOG = orig_err
+            parsing.LITELLM_OUT_LOG = orig_out
+
+        assert results[err_path]["rotated"] is True
+        assert os.path.exists(f"{err_path}.1")
+
+
+def test_rotate_missing_file_is_skipped():
+    """rotate must not crash when a log file is missing; it returns
+    rotated=False with reason='missing'."""
+    import tempfile, os
+    from openclaw_audit import parsing
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        orig_err = parsing.LITELLM_ERR_LOG
+        orig_out = parsing.LITELLM_OUT_LOG
+        parsing.LITELLM_ERR_LOG = os.path.join(tmpdir, "missing.err.log")
+        parsing.LITELLM_OUT_LOG = os.path.join(tmpdir, "missing.out.log")
+        try:
+            results = parsing.rotate_litellm_logs(keep=3)
+        finally:
+            parsing.LITELLM_ERR_LOG = orig_err
+            parsing.LITELLM_OUT_LOG = orig_out
+
+        for path, r in results.items():
+            assert r["rotated"] is False
+            assert r["reason"] == "missing"
 
 
 # ─── OpenClaw level path + new event types ───────────────────────────

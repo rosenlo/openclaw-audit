@@ -4,11 +4,19 @@ import glob
 import json
 import os
 import re
+import shutil
 import sys
 from collections import Counter
-from datetime import datetime, timedelta as _td
+from datetime import datetime
 
-from .config import LOG_DIR, LITELLM_ERR_LOG, LITELLM_OUT_LOG, LOCAL_TZ, now_local
+from .config import (
+    LITELLM_ERR_LOG,
+    LITELLM_LOG_KEEP,
+    LITELLM_LOG_MAX_SIZE_BYTES,
+    LITELLM_OUT_LOG,
+    LOG_DIR,
+    LOCAL_TZ,
+)
 from .util import parse_ts, tz_offset_str
 
 
@@ -96,31 +104,12 @@ def parse_openclaw_logs_since(since=None):
 
 
 # ─── LiteLLM 日志解析 ──────────────────────────────────────────────
-# LiteLLM 写 err.log 有两种格式，由它进程内的 _logging.py 决定：
-#   1) 默认文本：`HH:MM:SS - LiteLLM Router:ERROR: file.py:97 - ...`
-#      datefmt="%H:%M:%S" 是写死的，config.yaml 没暴露，所以没有日期。
-#   2) JSON（设 JSON_LOGS=true 启用 JsonFormatter）：每行一个 JSON 对象，
-#      timestamp = datetime.fromtimestamp(record.created).isoformat()，
-#      带完整日期年份，是根治“只有时分秒需要推断”的来源。
-# 优先按 JSON 解析；失败再回退文本格式。文本格式仍保留跨午夜推断，但
-# 加阈值，避免同日内日志乱序被误判成跨天。
-ansi_pat = re.compile(r"\033\[[0-9;]*m")
-text_line_pat = re.compile(
-    r"^(\d{2}:\d{2}:\d{2})\s*-\s*LiteLLM\s+(\S+):(\S+):\s+(.*)$"
-)
-# 同日内日志乱序（多 worker / 缓冲刷新 / 同秒多条）导致的时间倒退幅度一般
-# 在几分钟以内；真正的跨午夜倒退是从深夜回到凌晨，幅度巨大（>12h）。
-# 用 12 小时作为阈值：倒退超过 12h 才认为是跨了午夜，否则视为同日乱序，
-# 保持当天日期不再 +1。这样 22:25 -> 22:22 这种不会被标成明天。
-_MIDNIGHT_BACKSTEP_THRESHOLD_SECONDS = 12 * 3600
-
-
-def _backstep_seconds(prev_hms, cur_hms):
-    """Seconds from cur_hms back to prev_hms, assuming same day. cur < prev."""
-    base = datetime(2000, 1, 1)
-    a = base.replace(hour=prev_hms.hour, minute=prev_hms.minute, second=prev_hms.second)
-    b = base.replace(hour=cur_hms.hour, minute=cur_hms.minute, second=cur_hms.second)
-    return (a - b).total_seconds()
+# LiteLLM err.log 在 JSON_LOGS=true 时每行一个 JSON 对象,timestamp 带完整日期。
+# 老的 `HH:MM:SS - LiteLLM ...:` 文本格式没有日期,先前用 cur_date=今天 fallback
+# 会让历史事件漂移到未来 (06-15 的事件被标成今天,跨午夜逻辑又把它推到明天)。
+# litellm 06-20 已切到 JSON_LOGS,文本行都是死历史,不再产生,直接跳过。
+# 若你的 err.log 仍有文本行,在 LiteLLM 进程设 JSON_LOGS=true (注意不是
+# LITELLM_LOG=JSON,后者会被当成日志级别解析报错)。
 
 
 def _litellm_json_entry(obj, since_ts):
@@ -146,8 +135,13 @@ def _litellm_json_entry(obj, since_ts):
 
 
 def parse_litellm_err_log(since=None):
-    """Parse litellm.err.log. Supports JSON logs (JSON_LOGS=true, preferred)
-    and the legacy `HH:MM:SS - LiteLLM ...:` text format (mtime-cached)."""
+    """Parse litellm.err.log (JSON_LOGS=true format, mtime-cached).
+
+    Legacy ``HH:MM:SS - LiteLLM ...:`` text-format lines are skipped: they
+    carry no date and were previously mis-stamped as 'today', drifting
+    historical events into the future. Enable ``JSON_LOGS=true`` on the
+    LiteLLM process if your err.log still contains text-format lines.
+    """
     return _cached_parse(
         LITELLM_ERR_LOG, lambda: _parse_litellm_err_log_raw(since)
     )
@@ -162,56 +156,19 @@ def _parse_litellm_err_log_raw(since=None):
     if since:
         since_ts = since.timestamp()
 
-    # 文本格式的日期推断游标：只有 HH:MM:SS 时按行序走，跨午夜才 +1 天。
-    cur_date = now_local().date()
-    prev_hms = None
-
     try:
         with open(LITELLM_ERR_LOG) as f:
             for line in f:
-                clean = ansi_pat.sub("", line).strip()
-                if not clean:
+                clean = line.strip()
+                if not clean or not clean.startswith("{"):
                     continue
-
-                # 优先 JSON（JSON_LOGS=true 输出）。
-                if clean.startswith("{"):
-                    try:
-                        obj = json.loads(clean)
-                    except json.JSONDecodeError:
-                        obj = None
-                    if obj is not None:
-                        ent = _litellm_json_entry(obj, since_ts)
-                        if ent is not None:
-                            entries.append(ent)
-                        continue
-
-                # 回退到文本格式。
-                m = text_line_pat.match(clean)
-                if m:
-                    ts_str = m.group(1)
-                    component = m.group(2)
-                    level = m.group(3)
-                    msg = m.group(4)
-
-                    parsed = parse_ts(ts_str)
-                    if parsed and since_ts is not None and parsed.timestamp() < since_ts:
-                        continue
-
-                    cur_hms = parsed.time() if parsed else None
-                    if (
-                        prev_hms is not None
-                        and cur_hms is not None
-                        and cur_hms < prev_hms
-                        and _backstep_seconds(prev_hms, cur_hms)
-                        >= _MIDNIGHT_BACKSTEP_THRESHOLD_SECONDS
-                    ):
-                        # 倒退幅度足够大才算真的跨了午夜；小幅倒退是同日
-                        # 乱序，保持当天日期，避免把 22:22 标成明天。
-                        cur_date = cur_date + _td(days=1)
-                    prev_hms = cur_hms
-
-                    full_ts = f"{cur_date}T{ts_str}{tz_offset_str(LOCAL_TZ)}"
-                    entries.append(("litellm", full_ts, level, f"[{component}] {msg}"))
+                try:
+                    obj = json.loads(clean)
+                except json.JSONDecodeError:
+                    continue
+                ent = _litellm_json_entry(obj, since_ts)
+                if ent is not None:
+                    entries.append(ent)
     except (IOError, OSError) as e:
         print(f"Warning: cannot read litellm err: {e}", file=sys.stderr)
 
@@ -244,3 +201,83 @@ def parse_litellm_out_log(since=None):
         print(f"Warning: cannot read litellm out: {e}", file=sys.stderr)
 
     return result
+
+
+# ─── LiteLLM 日志轮转 ──────────────────────────────────────────────
+# litellm 由 launchd 启动,stdout/stderr 被 launchd 重定向到 err.log/out.log。
+# launchd 不会轮转这些文件,所以 audit 在启动时检查大小并 copytruncate 轮转:
+#   1) 当前文件复制为 .1 (老的 .1 -> .2, ..., .keep 被删除)
+#   2) 原地清空当前文件 (litellm 的 fd 仍指向同一 inode,继续写入新内容)
+# copytruncate 在复制和清空之间有毫秒级窗口可能丢日志,但 litellm 不能 reopen
+# signal,这是不重启进程轮转的唯一方式。
+
+def rotate_litellm_logs(keep=None):
+    """Force-rotate litellm.err.log and litellm.out.log now.
+
+    Uses copytruncate so the LiteLLM process (whose stdout/stderr fd is
+    held open by launchd) keeps writing to the same inode without a
+    restart. Returns ``{path: {"rotated": bool, "reason": str}}``.
+    """
+    if keep is None:
+        keep = LITELLM_LOG_KEEP
+    return {
+        LITELLM_ERR_LOG: _rotate_one(LITELLM_ERR_LOG, keep),
+        LITELLM_OUT_LOG: _rotate_one(LITELLM_OUT_LOG, keep),
+    }
+
+
+def maybe_rotate_litellm_logs(max_size_bytes=None, keep=None):
+    """Rotate litellm logs if any file exceeds ``max_size_bytes``.
+
+    Returns ``{path: {"rotated": bool, "reason": str}}``; entries with
+    ``rotated=False`` indicate no action (file missing or too small).
+    """
+    if max_size_bytes is None:
+        max_size_bytes = LITELLM_LOG_MAX_SIZE_BYTES
+    if keep is None:
+        keep = LITELLM_LOG_KEEP
+    results = {}
+    for path in (LITELLM_ERR_LOG, LITELLM_OUT_LOG):
+        try:
+            st = os.stat(path)
+        except OSError:
+            results[path] = {"rotated": False, "reason": "missing"}
+            continue
+        if st.st_size < max_size_bytes:
+            results[path] = {
+                "rotated": False,
+                "reason": f"size={st.st_size} < {max_size_bytes}",
+            }
+            continue
+        results[path] = _rotate_one(path, keep)
+    return results
+
+
+def _rotate_one(path, keep):
+    """copytruncate-rotate a single log file in place.
+
+    Shifts existing ``.{i}`` files (highest dropped), copies current to
+    ``.1``, then truncates the current file so the writer's open fd stays
+    valid. Not concurrency-guarded; callers that need cross-process safety
+    should hold an external lock.
+    """
+    if not os.path.exists(path):
+        return {"rotated": False, "reason": "missing"}
+    try:
+        # Shift .{keep-1} -> .{keep} (dropped), ..., .1 -> .2.
+        # Iterate high to low so we don't clobber an existing .{i+1}.
+        for i in range(keep, 0, -1):
+            src = f"{path}.{i}"
+            if not os.path.exists(src):
+                continue
+            if i >= keep:
+                os.unlink(src)
+            else:
+                os.rename(src, f"{path}.{i + 1}")
+        # Copy current -> .1, then truncate in place.
+        shutil.copy2(path, f"{path}.1")
+        with open(path, "w"):
+            pass
+    except OSError as e:
+        return {"rotated": False, "reason": f"{type(e).__name__}: {e}"}
+    return {"rotated": True, "reason": f"copytruncated (kept {keep})"}
