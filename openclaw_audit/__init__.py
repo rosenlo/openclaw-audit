@@ -8,7 +8,7 @@ CLI/web/watch wrapper that imports from here.
 from .config import LOCAL_TZ, now_local
 from .util import (
     BOLD, CYAN, DIM, GREEN, RED, YELLOW,
-    _extract_fields, _fmt_ts, _parse_int_field, _session_id_from_key,
+    _extract_fields, _fmt_ts, _parse_int_field, _session_id_from_key, _truncate,
     color, fmt_duration, parse_ts,
 )
 from .classify import classify_entry, classify_litellm_entry
@@ -26,7 +26,7 @@ __all__ = [
     "LOCAL_TZ", "now_local",
     # util
     "BOLD", "CYAN", "DIM", "GREEN", "RED", "YELLOW",
-    "_extract_fields", "_fmt_ts", "_parse_int_field", "_session_id_from_key",
+    "_extract_fields", "_fmt_ts", "_parse_int_field", "_session_id_from_key", "_truncate",
     "color", "fmt_duration", "parse_ts",
     # classify
     "classify_entry", "classify_litellm_entry",

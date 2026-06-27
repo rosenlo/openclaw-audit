@@ -111,6 +111,17 @@ def classify_entry(msg, level):
         cat["type"] = "transcript_mirror_failed"
         return cat
 
+    # Silent transcript gap variant: when EmbeddedAttemptSessionTakeoverError
+    # fires on the lane task / cleanup path (e.g. prompt reacquire after a
+    # compaction), the mirror call is never reached, so the
+    # "failed to mirror" WARN above is NOT logged — the gap is silent.
+    # This typically surfaces as `lane task error: ... error="EmbeddedAttemptSessionTakeoverError: ..."`
+    # or `Embedded agent failed before reply: ...`. Catch it here so the gap
+    # stays observable instead of disappearing into generic ERROR noise.
+    if "embeddedattemptsessiontakeovererror" in ml:
+        cat["type"] = "takeover_error_silent_gap"
+        return cat
+
     if "model-fetch" in ml and "error" in ml:
         cat["type"] = "llm_error"
         for part in msg.split():

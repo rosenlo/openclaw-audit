@@ -130,6 +130,21 @@ def _parse_int_field(part):
         return None
 
 
+def _truncate(s, n=300, marker="…"):
+    """Truncate string to n chars; append marker when truncated.
+
+    Unlike a bare `s[:n]`, this surfaces the truncation so a reader does
+    not mistake a clipped path/error message for the full string. Returns
+    the input unchanged when it already fits.
+    """
+    if s is None:
+        return s
+    if len(s) <= n:
+        return s
+    # Leave room for the marker so the visible width is exactly n.
+    return s[: n - len(marker)] + marker
+
+
 def fmt_duration(sec):
     if sec is None:
         return "N/A"

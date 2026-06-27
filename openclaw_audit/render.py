@@ -4,7 +4,7 @@ from .config import LOCAL_TZ, now_local
 from .insights import build_root_cause_summary, build_suggestions
 from .util import (
     BOLD, CYAN, DIM, GREEN, RED, YELLOW,
-    _session_id_from_key, fmt_duration, parse_ts, tz_offset_str,
+    _session_id_from_key, _truncate, fmt_duration, parse_ts, tz_offset_str,
 )
 
 
@@ -192,7 +192,7 @@ def render_events(events):
         elif level == "WARN":
             tag_class = "tag-warn"
         ts_display = format_event_time(ev.get("time", ""))
-        detail = (ev.get("detail") or "")[:150]
+        detail = _truncate(ev.get("detail") or "", 250)
         rows.append(
             f'<div class="event">'
             f'<span class="ts">{ts_display}</span>'
@@ -281,6 +281,8 @@ def print_report(result, sqlite_info, sessions_info=None):
     print(f"     ├─ Telegram 回复:        {GREEN(str(_send_ok)) if _send_ok else '0'} 条 (处理异常: {RED(str(s['telegram_out'])) if s['telegram_out'] else '0'}, 发送错误: {RED(str(tg_result['errors'])) if tg_result['errors'] else '0'})")
     _tmf = s.get("transcript_mirror_failures", 0)
     print(f"     ├─ 会话记录缺失:          {YELLOW(str(_tmf)) if _tmf else GREEN('0')} 条 (送达成功但 transcript 镜像失败)")
+    _tsg = s.get("takeover_silent_gaps", 0)
+    print(f"     ├─ 静默记录缺失:          {RED(str(_tsg)) if _tsg else GREEN('0')} 条 (takeover 在 mirror 前抛出,无 WARN)")
     print(f"     ├─ LLM 调用错误:         {RED(str(s['llm_errors'])) if s['llm_errors'] else GREEN('0')} 次")
     print(f"     ├─ LLM 中断:             {YELLOW(str(s['llm_aborts'])) if s['llm_aborts'] else GREEN('0')} 次")
     print(f"     ├─ LLM 超时:             {RED(str(s['llm_timeouts'])) if s['llm_timeouts'] else GREEN('0')} 次")
@@ -386,7 +388,7 @@ def print_report(result, sqlite_info, sessions_info=None):
                 src_tag = DIM("[L]")
             else:
                 src_tag = ""
-            detail = ev.get("detail", "")[:200]
+            detail = _truncate(ev.get("detail", ""), 300)
             level = ev.get("level", "")
             prefix = RED("✗") if level == "ERROR" else (YELLOW("!") if level == "WARN" else "·")
             print(f"     {prefix} {DIM(ts_display)} {src_tag} {ev['type']}")

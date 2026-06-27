@@ -35,6 +35,8 @@ def build_suggestions(result, tg_result=None):
         suggestions.append("🟡 Edit工具失败过多 — 长文本编辑建议用 Write 替代 Edit")
     if s.get("transcript_mirror_failures", 0) > 0:
         suggestions.append("🟡 会话记录镜像失败 — 消息已送达 Telegram 但 session transcript 缺失,留意后续 compaction 是否丢上下文")
+    if s.get("takeover_silent_gaps", 0) > 0:
+        suggestions.append("🔴 静默会话记录缺失 — EmbeddedAttemptSessionTakeoverError 在 mirror 调用前抛出,transcript gap 无 WARN,需结合 lane task error 日志定位")
     if tg_result.get("errors", 0) > 0:
         suggestions.append("🔴 Telegram 回复失败 — 需关注消息发送链路")
     if l.get("warnings", 0) > 0:
@@ -66,6 +68,8 @@ def build_root_cause_summary(result):
         ranked.append(("Telegram 连接问题", s["connection_issues"], "fetch timeout / closed before connect"))
     if s.get("transcript_mirror_failures", 0) > 0:
         ranked.append(("会话记录镜像失败", s.get("transcript_mirror_failures", 0), "session file changed mid-turn"))
+    if s.get("takeover_silent_gaps", 0) > 0:
+        ranked.append(("静默会话记录缺失", s.get("takeover_silent_gaps", 0), "EmbeddedAttemptSessionTakeoverError before mirror"))
 
     if not ranked:
         return "本窗口未见明显异常，链路整体正常。"
