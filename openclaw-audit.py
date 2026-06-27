@@ -87,6 +87,10 @@ def cli_mode(args):
     result = analyze(entries, since)
     sqlite_info = query_sqlite()
     sessions_info = query_sessions()
+    # Attach to result so build_suggestions() can surface task_run /
+    # announce failures and context-window thresholds as suggestions.
+    result["sqlite_info"] = sqlite_info
+    result["sessions_info"] = sessions_info
     print_report(result, sqlite_info, sessions_info)
 
 
@@ -147,6 +151,13 @@ def web_mode(args):
             entries.sort(key=lambda x: x[1])
             result = analyze(entries, since)
             result["sessions"] = query_sessions()
+            # Attach to result so build_suggestions() can surface
+            # task_run / announce failures and context-window thresholds.
+            # sqlite_info is queried separately (see get_sqlite) to keep
+            # its own shorter TTL, but we still attach the cached value
+            # here when available so suggestions can use it.
+            result["sessions_info"] = result["sessions"]
+            result["sqlite_info"] = get_sqlite()
             result["_generated_at"] = _generated_at_str()
             _data_cache[since_param] = (now, result)
             return result, None

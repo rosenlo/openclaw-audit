@@ -208,6 +208,50 @@ def analyze(entries, since=None):
             elif etype == "read_failed":
                 result["tool_errors"]["read"] += 1
 
+            elif etype == "long_running_session":
+                # openclaw emits this every ~5 min for sessions stuck in
+                # state=processing. Surface as a WARN event so the dashboard
+                # shows the session is taking long, even if it hasn't yet
+                # escalated to stalled_session. Don't double-count: if the
+                # same session is also classified as stalled_session (which
+                # carries more detail), that one wins.
+                detail_parts = [
+                    f"state={cat.get('state','?')}",
+                    f"age={cat.get('age','?')}",
+                    f"queueDepth={cat.get('queueDepth','?')}",
+                ]
+                if cat.get("activeWorkKind"):
+                    detail_parts.append(f"activeWorkKind={cat['activeWorkKind']}")
+                if cat.get("lastProgressAge"):
+                    detail_parts.append(f"lastProgressAge={cat['lastProgressAge']}")
+                if cat.get("sessionKey"):
+                    detail_parts.append(f"sessionKey={cat['sessionKey']}")
+                result["raw_events"].append({
+                    "source": "openclaw", "time": ts_str, "type": "⏳ 长时间运行",
+                    "detail": " ".join(detail_parts),
+                    "level": "WARN"
+                })
+
+            elif etype == "announce_giveup":
+                # Subagent announce retry-limit hit — parent will be wedged.
+                # Surface as ERROR so it ranks high in the event list.
+                result["raw_events"].append({
+                    "source": "openclaw", "time": ts_str,
+                    "type": "🔁 Announce放弃",
+                    "detail": _truncate(msg, 400),
+                    "level": "ERROR"
+                })
+
+            elif etype == "delivery_mode_mismatch":
+                # Parent session delivery state desynced — pairs with
+                # announce_giveup but on a different code path.
+                result["raw_events"].append({
+                    "source": "openclaw", "time": ts_str,
+                    "type": "🔗 Delivery状态错配",
+                    "detail": _truncate(msg, 400),
+                    "level": "ERROR"
+                })
+
             elif etype in ("lane_error", "fetch_timeout", "agent_end"):
                 result["raw_events"].append({
                     "source": "openclaw", "time": ts_str, "type": f"⚠️ {cat.get('type','?')}",

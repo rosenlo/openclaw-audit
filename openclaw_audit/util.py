@@ -111,13 +111,26 @@ def _session_id_from_key(key):
 
 
 def _extract_fields(msg, wanted):
-    """Extract key=value fields from a log message."""
+    """Extract key=value fields from a log message.
+
+    Handles two value shapes:
+    - ``key=value`` (no whitespace) — the common OpenClaw log shape
+    - ``key="value with spaces"`` or ``key='value'`` — quoted values, used
+      by announce-delivery error strings like
+      ``deliveryError="completion agent did not use the message tool"``.
+    """
     wanted = set(wanted)
     found = {}
-    for m in re.finditer(r"(\w+)=([^\s]+)", msg):
+    # Quoted values: key="..." or key='...' (single capture, non-greedy).
+    for m in re.finditer(r'(\w+)=("([^"]*)"|\'([^\']*)\'|(\S+))', msg):
         key = m.group(1)
-        if key in wanted:
-            found[key] = m.group(2)
+        if key not in wanted:
+            continue
+        # Prefer the quoted inner group when present, else the bare value.
+        val = m.group(3) if m.group(3) is not None else (
+            m.group(4) if m.group(4) is not None else m.group(5)
+        )
+        found[key] = val
     return found
 
 

@@ -1421,3 +1421,404 @@ def test_api_data_endpoint_does_not_leak_sqlite_into_data_cache():
         assert d1["sqlite"] == d2["sqlite"]
     finally:
         _stop_web_server(proc)
+
+
+# ─── SQLite failure surfacing (1a) + session-state badges (1b) ──────
+
+
+def test_sqlite_recent_task_failures_surfaced():
+    """query_sqlite must surface recent failed/lost task_runs with their
+    error text so FailoverError / Codex limit are visible without reading
+    raw logs. This test stubs the SQLite file with the production schema
+    and verifies the failure rows are returned."""
+    import tempfile, os, sqlite3
+    from openclaw_audit import queries
+
+    with tempfile.TemporaryDirectory() as d:
+        db_path = os.path.join(d, "openclaw.sqlite")
+        conn = sqlite3.connect(db_path)
+        # Minimal schema matching production (only columns we read).
+        conn.executescript("""
+            CREATE TABLE task_runs (
+                task_id TEXT PRIMARY KEY, status TEXT NOT NULL,
+                ended_at INTEGER, error TEXT, label TEXT
+            );
+        """)
+        # A recent failure (age_min < 60) and an old one (> 60).
+        import time
+        now_ms = int(time.time() * 1000)
+        conn.execute(
+            "INSERT INTO task_runs VALUES (?,?,?,?,?)",
+            ("recent-fail", "failed", now_ms - 5 * 60 * 1000,
+             'FailoverError: No API key found for provider "openai"', "Review PR #80")
+        )
+        conn.execute(
+            "INSERT INTO task_runs VALUES (?,?,?,?,?)",
+            ("old-fail", "failed", now_ms - 120 * 60 * 1000,
+             "FailoverError: old error", "old task")
+        )
+        conn.commit()
+        conn.close()
+
+        orig = queries.SQLITE_DB
+        queries.SQLITE_DB = db_path
+        try:
+            info = queries.query_sqlite()
+        finally:
+            queries.SQLITE_DB = orig
+
+        assert "recent_task_failures" in info
+        fails = info["recent_task_failures"]
+        # Both rows returned (query doesn't filter by age, that's done in
+        # suggestions); check the recent one is present with right fields.
+        recent = [f for f in fails if f["status"] == "failed" and f["age_min"] <= 10]
+        assert len(recent) == 1
+        assert "No API key" in recent[0]["error"]
+        assert recent[0]["label"] == "Review PR #80"
+
+
+def test_sqlite_announce_failures_surfaced():
+    """query_sqlite must surface subagent_runs with last_announce_delivery_error
+    set — these are the wedged-parent events."""
+    import tempfile, os, sqlite3, time
+    from openclaw_audit import queries
+
+    with tempfile.TemporaryDirectory() as d:
+        db_path = os.path.join(d, "openclaw.sqlite")
+        conn = sqlite3.connect(db_path)
+        conn.executescript("""
+            CREATE TABLE subagent_runs (
+                run_id TEXT PRIMARY KEY,
+                last_announce_delivery_error TEXT,
+                announce_retry_count INTEGER,
+                ended_reason TEXT,
+                ended_at INTEGER
+            );
+        """)
+        now_ms = int(time.time() * 1000)
+        conn.execute(
+            "INSERT INTO subagent_runs VALUES (?,?,?,?,?)",
+            ("abc12345", "completion agent did not use the message tool",
+             3, "subagent-error", now_ms - 10 * 60 * 1000)
+        )
+        conn.commit()
+        conn.close()
+
+        orig = queries.SQLITE_DB
+        queries.SQLITE_DB = db_path
+        try:
+            info = queries.query_sqlite()
+        finally:
+            queries.SQLITE_DB = orig
+
+        assert "recent_announce_failures" in info
+        ann = info["recent_announce_failures"]
+        assert len(ann) == 1
+        assert ann[0]["run_id"] == "abc12345"
+        assert ann[0]["retries"] == 3
+        assert "message tool" in ann[0]["error"]
+
+
+def test_suggestion_surfaces_failover_error_from_sqlite():
+    """When sqlite_info has recent task_run failures with FailoverError,
+    build_suggestions must surface a suggestion pointing at the API key
+    issue rather than the generic 'system normal' message."""
+    from openclaw_audit import analyze, build_suggestions
+
+    result = analyze([])  # no log events → no session_stalls / llm_aborts
+    result["sqlite_info"] = {
+        "recent_task_failures": [
+            {"status": "failed", "age_min": 5.0,
+             "error": 'FailoverError: No API key found for provider "openai"',
+             "label": "Review PR #80"},
+            {"status": "failed", "age_min": 10.0,
+             "error": 'FailoverError: No API key found for provider "openai"',
+             "label": "Review PR #81"},
+        ]
+    }
+    result["sessions_info"] = {"active": []}
+
+    suggestions = build_suggestions(result, {"errors": 0})
+    failover_sugs = [s for s in suggestions if "子Agent启动失败" in s or "FailoverError" in s]
+    assert len(failover_sugs) == 1
+    assert "API key" in failover_sugs[0]
+    assert "近1h" in failover_sugs[0]
+
+
+def test_suggestion_surfaces_codex_subscription_limit():
+    """Codex subscription usage limit errors must surface with the reset
+    time so the operator knows when the next attempt can happen."""
+    from openclaw_audit import analyze, build_suggestions
+
+    result = analyze([])
+    result["sqlite_info"] = {
+        "recent_task_failures": [
+            {"status": "failed", "age_min": 5.0,
+             "error": "Codex subscription usage limit. Next reset in 4 hours, Jun 27 at 12:31 PM",
+             "label": ""},
+        ]
+    }
+    result["sessions_info"] = {"active": []}
+
+    suggestions = build_suggestions(result, {"errors": 0})
+    codex_sugs = [s for s in suggestions if "Codex" in s or "订阅" in s]
+    assert len(codex_sugs) == 1
+    assert "4 hours" in codex_sugs[0]
+
+
+def test_suggestion_announce_give_up_wedged_parent():
+    """Recent subagent announce give-up failures must surface as a
+    wedged-parent warning."""
+    from openclaw_audit import analyze, build_suggestions
+
+    result = analyze([])
+    result["sqlite_info"] = {
+        "recent_announce_failures": [
+            {"run_id": "abc12345", "age_min": 8.0,
+             "error": "completion agent did not use the message tool",
+             "retries": 3, "ended_reason": "subagent-error"}
+        ]
+    }
+    result["sessions_info"] = {"active": []}
+
+    suggestions = build_suggestions(result, {"errors": 0})
+    ann_sugs = [s for s in suggestions if "Announce give-up" in s or "wedged" in s]
+    assert len(ann_sugs) == 1
+    assert "wedged" in ann_sugs[0].lower()
+
+
+def test_suggestion_context_window_new_at_80pct():
+    """A direct session at >=80% context usage must trigger a /new
+    suggestion (overflow imminent, /compact too late)."""
+    from openclaw_audit import analyze, build_suggestions
+
+    result = analyze([])
+    result["sqlite_info"] = {}
+    result["sessions_info"] = {
+        "active": [{
+            "kind": "direct", "model": "agnes-flash",
+            "totalTokens": 210000, "contextTokens": 262144,
+            "usagePct": 80.1, "hasTokens": True, "isFailed": False,
+            "key": "agent:main:telegram:direct:670530854",
+            "sessionId": "1410a53b", "abortedLastRun": False,
+            "tokensFresh": True, "ageMs": 60000,
+        }]
+    }
+
+    suggestions = build_suggestions(result, {"errors": 0})
+    new_sugs = [s for s in suggestions if "/new" in s]
+    assert len(new_sugs) == 1
+    assert "1410a53b" in new_sugs[0]
+
+
+def test_suggestion_context_window_compact_at_60pct():
+    """A direct session at 60-79% context usage must trigger a /compact
+    suggestion (still room, but trim before getting close to the limit)."""
+    from openclaw_audit import analyze, build_suggestions
+
+    result = analyze([])
+    result["sqlite_info"] = {}
+    result["sessions_info"] = {
+        "active": [{
+            "kind": "direct", "model": "agnes-flash",
+            "totalTokens": 170000, "contextTokens": 262144,
+            "usagePct": 64.8, "hasTokens": True, "isFailed": False,
+            "key": "agent:main:telegram:direct:670530854",
+            "sessionId": "1410a53b", "abortedLastRun": False,
+            "tokensFresh": True, "ageMs": 60000,
+        }]
+    }
+
+    suggestions = build_suggestions(result, {"errors": 0})
+    compact_sugs = [s for s in suggestions if "/compact" in s]
+    assert len(compact_sugs) == 1
+    assert "1410a53b" in compact_sugs[0]
+
+
+def test_suggestion_no_context_suggestion_for_subagent():
+    """Subagent sessions (kind=spawn-child) must NOT trigger /compact or
+    /new suggestions — they're short-lived and reclaimed by the parent."""
+    from openclaw_audit import analyze, build_suggestions
+
+    result = analyze([])
+    result["sqlite_info"] = {}
+    result["sessions_info"] = {
+        "active": [{
+            "kind": "spawn-child", "model": "gpt-5.4-mini",
+            "totalTokens": 250000, "contextTokens": 258000,
+            "usagePct": 96.9, "hasTokens": True, "isFailed": False,
+            "key": "agent:main:subagent:abc",
+            "sessionId": "abc", "abortedLastRun": False,
+            "tokensFresh": True, "ageMs": 1000,
+        }]
+    }
+
+    suggestions = build_suggestions(result, {"errors": 0})
+    ctx_sugs = [s for s in suggestions if "/compact" in s or "/new" in s]
+    assert len(ctx_sugs) == 0
+
+
+def test_suggestion_aborted_main_session_no_tokens():
+    """A direct session with abortedLastRun=True and no token data must
+    surface an aborted-session suggestion (no context % to compute)."""
+    from openclaw_audit import analyze, build_suggestions
+
+    result = analyze([])
+    result["sqlite_info"] = {}
+    result["sessions_info"] = {
+        "active": [{
+            "kind": "direct", "model": "agnes-flash",
+            "totalTokens": None, "contextTokens": 262144,
+            "usagePct": None, "hasTokens": False, "isFailed": False,
+            "key": "agent:main:telegram:direct:670530854",
+            "sessionId": "1410a53b", "abortedLastRun": True,
+            "tokensFresh": False, "ageMs": 240000,
+        }]
+    }
+
+    suggestions = build_suggestions(result, {"errors": 0})
+    abort_sugs = [s for s in suggestions if "abort" in s.lower()]
+    assert len(abort_sugs) == 1
+    assert "1410a53b" in abort_sugs[0]
+
+
+def test_session_status_badge_aborted():
+    """_session_status_badge must return '⚠ aborted' when abortedLastRun."""
+    from openclaw_audit.render import _session_status_badge
+    assert _session_status_badge({"abortedLastRun": True}) == "⚠ aborted"
+
+
+def test_session_status_badge_stale_tokens():
+    """_session_status_badge must return '⊘ stale' when tokensFresh=False."""
+    from openclaw_audit.render import _session_status_badge
+    assert _session_status_badge({"tokensFresh": False}) == "⊘ stale"
+
+
+def test_session_status_badge_idle_direct():
+    """A direct session idle >1h must show '💤 idle'."""
+    from openclaw_audit.render import _session_status_badge
+    assert _session_status_badge({"kind": "direct", "ageMs": 3700 * 1000}) == "💤 idle"
+
+
+def test_session_status_badge_active_direct():
+    """A direct session ageMs < 1min must show '⚙ active'."""
+    from openclaw_audit.render import _session_status_badge
+    assert _session_status_badge({"kind": "direct", "ageMs": 30 * 1000}) == "⚙ active"
+
+
+def test_session_status_badge_empty_for_subagent_idle():
+    """Subagent sessions don't get idle/active badges — they're short-lived."""
+    from openclaw_audit.render import _session_status_badge
+    assert _session_status_badge({"kind": "spawn-child", "ageMs": 3700 * 1000}) == ""
+
+
+# ─── 1c: long-running / announce give-up / delivery mismatch classifiers ─
+
+
+def test_classify_long_running_session():
+    """openclaw emits `long-running session:` every ~5 min for sessions
+    stuck in state=processing. The classifier must tag it so the dashboard
+    surfaces it (previously fell into 'other' and was dropped)."""
+    from openclaw_audit import classify_entry
+    msg = (
+        "long-running session: sessionId=15baa03a-a4be-419f-896a-9367e85fb5c9 "
+        "sessionKey=agent:main:telegram:direct:670530854 state=processing "
+        "age=1185s queueDepth=2 reason=queued_behind_active_work "
+        "classification=long_running activeWorkKind=model_call "
+        "lastProgress=model_call:started lastProgressAge=7s recovery=none"
+    )
+    cat = classify_entry(msg, "WARN")
+    assert cat["type"] == "long_running_session"
+    assert cat["state"] == "processing"
+    assert cat["age"] == "1185s"
+    assert cat["queueDepth"] == "2"
+    assert cat["activeWorkKind"] == "model_call"
+    assert cat["lastProgressAge"] == "7s"
+    assert cat["sessionKey"] == "agent:main:telegram:direct:670530854"
+
+
+def test_classify_announce_giveup():
+    """Subagent announce give-up (retry-limit hit) must classify as
+    announce_giveup so it surfaces as an ERROR event."""
+    from openclaw_audit import classify_entry
+    msg = (
+        "Subagent announce give up (retry-limit) run=7d3e05bb "
+        "child=agent:main:subagent:d7f20755 "
+        "requester=agent:main:telegram:direct:670530854 retries=3 "
+        "endedAgo=18s deliveryError=\"completion agent did not use the message tool\""
+    )
+    cat = classify_entry(msg, "WARN")
+    assert cat["type"] == "announce_giveup"
+    assert cat["run"] == "7d3e05bb"
+    assert cat["retries"] == "3"
+    assert "message tool" in cat.get("deliveryError", "")
+
+
+def test_classify_delivery_mode_mismatch():
+    """source_reply_delivery_mode_mismatch must classify distinctly so the
+    dashboard can pair it with announce_giveup for the wedged-parent story."""
+    from openclaw_audit import classify_entry
+    msg = (
+        "Active requester session could not be woken for subagent completion; "
+        "falling back to requester-agent handoff: queue_message_failed "
+        "reason=source_reply_delivery_mode_mismatch "
+        "sessionId=15baa03a-a4be-419f-896a-9367e85fb5c9 gatewayHealth=live"
+    )
+    cat = classify_entry(msg, "WARN")
+    assert cat["type"] == "delivery_mode_mismatch"
+    assert cat["sessionId"] == "15baa03a-a4be-419f-896a-9367e85fb5c9"
+
+
+def test_analyze_long_running_session_surfaces_as_warn_event():
+    """A long-running-session log entry must produce a WARN raw_event so
+    the dashboard event list shows it (previously it was dropped)."""
+    from openclaw_audit import analyze
+    msg = (
+        "long-running session: sessionId=15baa03a sessionKey=agent:main:telegram:direct:670530854 "
+        "state=processing age=585s queueDepth=2 reason=queued_behind_active_work "
+        "classification=long_running activeWorkKind=model_call "
+        "lastProgress=model_call:stream_progress lastProgressAge=2s recovery=none"
+    )
+    result = analyze([("openclaw", "2026-06-27T13:21:01+08:00", "WARN", msg)])
+    events = result["raw_events"]
+    assert len(events) == 1
+    assert events[0]["type"] == "⏳ 长时间运行"
+    assert events[0]["level"] == "WARN"
+    assert "state=processing" in events[0]["detail"]
+    assert "age=585s" in events[0]["detail"]
+    assert "queueDepth=2" in events[0]["detail"]
+    assert "activeWorkKind=model_call" in events[0]["detail"]
+
+
+def test_analyze_announce_giveup_surfaces_as_error_event():
+    """Announce give-up must surface as an ERROR event (it wedges the parent)."""
+    from openclaw_audit import analyze
+    msg = (
+        "Subagent announce give up (retry-limit) run=7d3e05bb "
+        "child=agent:main:subagent:d7f20755 "
+        "requester=agent:main:telegram:direct:670530854 retries=3 "
+        "deliveryError=\"completion agent did not use the message tool\""
+    )
+    result = analyze([("openclaw", "2026-06-27T08:57:21+08:00", "WARN", msg)])
+    events = result["raw_events"]
+    assert len(events) == 1
+    assert events[0]["type"] == "🔁 Announce放弃"
+    assert events[0]["level"] == "ERROR"
+    assert "7d3e05bb" in events[0]["detail"]
+
+
+def test_analyze_delivery_mode_mismatch_surfaces_as_error_event():
+    """delivery_mode_mismatch must surface as ERROR so the wedged-parent
+    story is visible in the dashboard even when announce_giveup is absent."""
+    from openclaw_audit import analyze
+    msg = (
+        "Active requester session could not be woken for subagent completion; "
+        "queue_message_failed reason=source_reply_delivery_mode_mismatch "
+        "sessionId=15baa03a gatewayHealth=live"
+    )
+    result = analyze([("openclaw", "2026-06-27T13:35:12+08:00", "WARN", msg)])
+    events = result["raw_events"]
+    assert len(events) == 1
+    assert events[0]["type"] == "🔗 Delivery状态错配"
+    assert events[0]["level"] == "ERROR"
+    assert "15baa03a" in events[0]["detail"]
