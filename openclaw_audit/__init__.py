@@ -13,8 +13,12 @@ from .util import (
 )
 from .classify import classify_entry, classify_litellm_entry
 from .parsing import (
-    parse_litellm_err_log, parse_litellm_out_log,
-    parse_openclaw_log, parse_openclaw_logs_since,
+    maybe_rotate_litellm_logs,
+    parse_litellm_err_log,
+    parse_litellm_out_log,
+    parse_openclaw_log,
+    parse_openclaw_logs_since,
+    rotate_litellm_logs,
 )
 from .analyze import analyze
 from .insights import build_root_cause_summary, build_suggestions
@@ -31,8 +35,10 @@ __all__ = [
     # classify
     "classify_entry", "classify_litellm_entry",
     # parsing
+    "maybe_rotate_litellm_logs",
     "parse_litellm_err_log", "parse_litellm_out_log",
     "parse_openclaw_log", "parse_openclaw_logs_since",
+    "rotate_litellm_logs",
     # analyze
     "analyze",
     # insights

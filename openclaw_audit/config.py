@@ -35,6 +35,15 @@ LITELLM_DIR = os.path.expanduser(LITELLM_DIR)
 LITELLM_OUT_LOG = os.path.join(LITELLM_DIR, "litellm.out.log")
 LITELLM_ERR_LOG = os.path.join(LITELLM_DIR, "litellm.err.log")
 
+# ─── LiteLLM 日志轮转 ─────────────────────────────────────────────
+# litellm.err.log / out.log 由 launchd 重定向,不会自动轮转。audit 在启动时
+# 检查大小,超过阈值就 copytruncate 轮转 (litellm 不能 reopen signal,只能
+# 原地清空)。用 env var 可调;默认 50MB / 保留 5 份历史。
+LITELLM_LOG_MAX_SIZE_BYTES = int(
+    os.environ.get("LITELLM_LOG_MAX_SIZE_BYTES", str(50 * 1024 * 1024))
+)
+LITELLM_LOG_KEEP = int(os.environ.get("LITELLM_LOG_KEEP", "5"))
+
 # ─── 时区 ───────────────────────────────────────────────────────────
 # 优先级:
 #   1) OPENCLAW_AUDIT_TZ 显式覆盖 (+07:00 / -05:00 / +05:30 / +0700 / +07 / UTC)

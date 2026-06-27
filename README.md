@@ -52,6 +52,12 @@ Run in watch mode:
 python3 openclaw-audit.py --watch --hours 3 --interval 30
 ```
 
+Force-rotate litellm logs (copytruncate, regardless of size):
+
+```bash
+python3 openclaw-audit.py --rotate-litellm-logs
+```
+
 ## Environment Variables
 
 All paths are overrideable so the repo stays portable and does not depend on one machine layout.
@@ -62,6 +68,8 @@ All paths are overrideable so the repo stays portable and does not depend on one
 | `OPENCLAW_LOG_DIR` | `/tmp/openclaw` | Directory containing `openclaw-*.log` |
 | `OPENCLAW_GATEWAY_LOG` | auto-detect | Gateway log path |
 | `LITELLM_DIR` | `~/litellm` | LiteLLM log directory |
+| `LITELLM_LOG_MAX_SIZE_BYTES` | `52428800` (50 MB) | Rotate litellm logs above this size at startup |
+| `LITELLM_LOG_KEEP` | `5` | Number of rotated litellm log backups to keep |
 | `OPENCLAW_AUDIT_TZ` | auto-detect from system | Audit timezone override: `+HH:MM`, `-HH:MM`, `+HHMM`, `+HH`, or `UTC` (supports half-hour offsets like `+05:30`). When unset, the audit follows the system local timezone (via `datetime.now().astimezone()`), so the dashboard "最后更新" / report "生成时间" suffix matches the host's actual tz instead of a hardcoded value. |
 | `OPENCLAW_NODE` | `node` | Node.js executable |
 | `OPENCLAW_CLI` | `openclaw` | OpenClaw CLI executable |
@@ -74,12 +82,27 @@ cp .env.example .env
 
 ## LiteLLM log format
 
-LiteLLM's `err.log` is written by its in-process `logging` formatter, whose `datefmt` is hardcoded to `%H:%M:%S` (no date). That leaves every line with only a time-of-day, which this tool used to infer the date from line order — fragile, because same-day log reordering looked like a midnight crossing and mis-stamped events onto the next day (breaking the time sort).
+LiteLLM's `err.log` is written by its in-process `logging` formatter. The default formatter uses `datefmt="%H:%M:%S"` (time-of-day only, no date), which is fragile — a cumulative `err.log` ends up mixing old text lines with current JSON lines, and dateless text lines were previously mis-stamped as "today", drifting historical events into the future.
 
-The fix has two sides:
+This tool only parses JSON lines (one JSON object per line with a full ISO-8601 `timestamp` including the date). Legacy `HH:MM:SS - LiteLLM ...:` text-format lines are skipped. To make `err.log` JSON-only:
 
-- **LiteLLM side (recommended):** set `JSON_LOGS=true` in the LiteLLM process environment so it emits one JSON object per line with a full ISO-8601 `timestamp` (date + year). `LITELLM_LOG=DEBUG` controls the level separately. Note: it's `JSON_LOGS`, not `LITELLM_LOG=JSON` — the latter is parsed as a log level and will raise.
-- **This tool:** parses JSON lines directly, and still supports the legacy `HH:MM:SS` text format for back-compat, with a 12h threshold on the midnight-inference backstep so small same-day reordering no longer flips the date.
+- Set `JSON_LOGS=true` in the LiteLLM process environment (it emits a JSON object per line with a full `timestamp` field). `LITELLM_LOG=DEBUG` controls the log level separately.
+- Note: it's `JSON_LOGS`, **not** `LITELLM_LOG=JSON` — the latter is parsed as a log level and will raise.
+
+## LiteLLM log rotation
+
+When LiteLLM is launched via `launchd` (macOS) or `systemd` (Linux) with stdout/stderr redirected to a file, the supervisor does not rotate those files — `litellm.err.log` and `litellm.out.log` grow unbounded and accumulate stale text-format history from before the `JSON_LOGS=true` flip.
+
+This tool rotates both files automatically at startup using copytruncate:
+
+- If a log file exceeds `LITELLM_LOG_MAX_SIZE_BYTES` (default 50 MB, configurable via env), it is copied to `.1` (existing `.1` → `.2`, …, files beyond `LITELLM_LOG_KEEP` are dropped), then truncated in place.
+- copytruncate keeps the LiteLLM process's open file descriptor valid (it continues writing to the same inode), at the cost of a millisecond-level window during which a log line could be lost — acceptable for an audit tool, and the only rotation mechanism that doesn't require restarting LiteLLM.
+- To force a rotation now (regardless of size): `python3 openclaw-audit.py --rotate-litellm-logs`.
+
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `LITELLM_LOG_MAX_SIZE_BYTES` | `52428800` (50 MB) | Rotate a log file when its size exceeds this |
+| `LITELLM_LOG_KEEP` | `5` | Number of rotated backups to keep (`.{1..keep}`) |
 
 ## Notes
 
