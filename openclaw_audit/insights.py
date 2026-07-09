@@ -37,6 +37,23 @@ def build_suggestions(result, tg_result=None):
         suggestions.append("🟡 会话记录镜像失败 — 消息已送达 Telegram 但 session transcript 缺失,留意后续 compaction 是否丢上下文")
     if s.get("takeover_silent_gaps", 0) > 0:
         suggestions.append("🔴 静默会话记录缺失 — EmbeddedAttemptSessionTakeoverError 在 mirror 调用前抛出,transcript gap 无 WARN,需结合 lane task error 日志定位")
+    if s.get("reply_session_stale_locks", 0) > 0:
+        suggestions.append(
+            "🔴 Reply session 卡死 (stale lock) — 同窗口 ≥2 次 reply session "
+            "initialization conflicted + codex harness history 读取失败,"
+            "说明 compaction 轮转后 reply session 仍绑定旧 sessionId,lock 不释放,"
+            "重启 gateway 才能恢复。属于 #88838 范围 (等 #96625 SQLite flip 修复),"
+            "短期重启即可,勿上报新 PR"
+        )
+    elif s.get("reply_session_init_conflicts", 0) > 0:
+        # Conflict events without the codex_read co-signal — still worth
+        # surfacing, but the operator should know the composite was not
+        # triggered (might be a different root cause).
+        suggestions.append(
+            f"🟡 Reply session 初始化冲突 {s['reply_session_init_conflicts']} 次 "
+            f"(未触发 stale-lock 组合) — Telegram 上一轮发送通常成功,"
+            f"问题在 session 状态而非发送链路"
+        )
     if tg_result.get("errors", 0) > 0:
         suggestions.append("🔴 Telegram 回复失败 — 需关注消息发送链路")
     if l.get("warnings", 0) > 0:
@@ -167,6 +184,8 @@ def build_root_cause_summary(result):
         ranked.append(("会话记录镜像失败", s.get("transcript_mirror_failures", 0), "session file changed mid-turn"))
     if s.get("takeover_silent_gaps", 0) > 0:
         ranked.append(("静默会话记录缺失", s.get("takeover_silent_gaps", 0), "EmbeddedAttemptSessionTakeoverError before mirror"))
+    if s.get("reply_session_stale_locks", 0) > 0:
+        ranked.append(("Reply session 卡死", s.get("reply_session_stale_locks", 0), "compaction rotated file but reply lock kept stale sessionId"))
 
     if not ranked:
         return "本窗口未见明显异常，链路整体正常。"
@@ -212,6 +231,14 @@ def build_root_cause_summary(result):
             f"主要问题是会话记录镜像失败，共 {top_count} 次。"
             f"消息已送达 Telegram，但 session transcript 因 session file 在 turn 中途被改动"
             f"（通常是 compaction 轮转）而没写入，后续 compaction/上下文回放可能缺失该条。"
+        )
+    if top_name == "Reply session 卡死":
+        return (
+            f"主要问题是 Reply session 卡死 (stale lock)，共 {top_count} 次。"
+            f"compaction 轮转后 reply session 仍绑定旧 sessionId,锁不释放,"
+            f"新进 reply 全部立即冲突,直到 gateway 重启才能恢复。"
+            f"Telegram 发送链路本身是好的 (上一轮通常已送达)。"
+            f"属于 #88838 范围,#96625 SQLite flip 是真正的修复。"
         )
     return (
         f"主要问题是 Telegram 连接问题，共 {top_count} 次。"

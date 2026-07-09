@@ -61,10 +61,78 @@ def _card(label, value, sublabel="", value_cls="", value_style=""):
     )
 
 
+def compute_health_score(s):
+    """Compute the health score and deduction reasons from the summary.
+
+    Shared between the CLI ``print_report`` path and the web dashboard
+    ``render_stats_health`` path so both stay in lockstep. Returns
+    ``(score, deductions, color_cls)`` where ``color_cls`` is the CSS
+    class name ('good' / 'warn' / 'bad') matching the CLI's GREEN/YELLOW/RED.
+
+    Each deduction line is short enough to render in both the CLI
+    (after ``扣分原因:``) and the web card (as a sublabel).
+    """
+    score = 100
+    deductions = []
+    if s["llm_timeouts"] > 0:
+        score -= min(s["llm_timeouts"] * 15, 60)
+        deductions.append(f"LLM超时 {s['llm_timeouts']}次")
+    if s["llm_aborts"] > 0:
+        score -= min(s["llm_aborts"] * 8, 24)
+        deductions.append(f"LLM中断 {s['llm_aborts']}次")
+    if s["litellm_upstream_timeouts"] > 0:
+        score -= min(s["litellm_upstream_timeouts"] * 10, 40)
+        deductions.append(f"Litellm上游超时 {s['litellm_upstream_timeouts']}次")
+    if s["session_stalls"] > 0:
+        score -= min(s["session_stalls"] * 6, 24)
+        deductions.append(f"任务卡住 {s['session_stalls']}次")
+    if s["failovers"] > 0:
+        score -= min(s["failovers"] * 5, 20)
+    if s["incomplete_turns"] > 0:
+        score -= min(s["incomplete_turns"] * 10, 20)
+    if s.get("reply_session_stale_locks", 0) > 0:
+        # Each stale-lock burst is a hard session-state failure that
+        # requires a gateway restart to recover — bigger deduction than
+        # a single failover/incomplete turn, capped at 25 so the score
+        # stays informative (not pinned at 0).
+        score -= min(s["reply_session_stale_locks"] * 15, 25)
+        deductions.append(f"Reply session卡死 {s['reply_session_stale_locks']}次")
+    if s["context_overflows"] > 5:
+        score -= 5
+    if s["connection_issues"] > 3:
+        score -= 5
+    score = max(score, 0)
+    color_cls = "good" if score >= 80 else ("warn" if score >= 50 else "bad")
+    return score, deductions, color_cls
+
+
+def render_stats_health(data):
+    """Render the health score as a single dashboard card.
+
+    Mirrors the CLI's ``健康评分: 85/100  扣分原因: ...`` line. The
+    score is the headline number; the deductions show as a sublabel so
+    the operator sees why without scrolling the event list. Color uses
+    the same thresholds as the CLI: green ≥80, yellow ≥50, red <50.
+    """
+    s = data["summary"]
+    score, deductions, color_cls = compute_health_score(s)
+    sub = "、".join(deductions) if deductions else "无扣分"
+    return _card("健康评分", f"{score}/100", sub, color_cls)
+
+
 def render_stats_openclaw(data):
     s = data["summary"]
     tg = data["telegram"]
     err_suffix = f' / {tg["errors"]} ❌' if tg["errors"] > 0 else ""
+    # Session-state failure cards. All four share the #88838 root cause
+    # (file-based session state racing compaction rotation) and are
+    # surfaced together so the operator sees the family at a glance
+    # instead of having to read the event list. The CLI shows the same
+    # counters as text lines; these cards mirror that for the web.
+    rsl = s.get("reply_session_stale_locks", 0)
+    chr_fail = s.get("codex_history_read_failures", 0)
+    tmf = s.get("transcript_mirror_failures", 0)
+    tsg = s.get("takeover_silent_gaps", 0)
     return "".join([
         _card("Telegram 消息", s["telegram_in"],
               f'回复 {s["telegram_out"]} 条{err_suffix}', "good"),
@@ -82,6 +150,29 @@ def render_stats_openclaw(data):
               "warn" if data["connection_issues"] > 2 else "good"),
         _card("Edit 工具失败", data["tool_errors"]["edit"], "",
               "warn" if data["tool_errors"]["edit"] > 10 else "good"),
+        # Reply session stale-lock composite — the headline failure.
+        # bad_at=1 because a single burst requires a gateway restart.
+        _card("Reply session 卡死", rsl,
+              "compaction 后 lock 绑旧 sessionId",
+              _cls_for_count(rsl, bad_at=1)),
+        # Leading indicator for the composite — the codex history read
+        # WARN precedes the conflict burst by 1–2 min in the observed
+        # incident. Surface it as a warn so the operator sees the
+        # precursor even when the composite has not yet fired.
+        _card("Codex 历史读取失败", chr_fail,
+              "embedded run 读 stale mirrored history",
+              _cls_for_count(chr_fail)),
+        # Pre-existing transcript mirror failures — already counted and
+        # shown as a CLI line, now also a web card for parity.
+        _card("会话记录缺失", tmf,
+              "送达成功但 transcript 镜像失败",
+              _cls_for_count(tmf)),
+        # Silent transcript gap — takeover throws before mirror runs, so
+        # no "failed to mirror" WARN fires. bad_at=1 because one silent
+        # gap means an undetected message-loss event.
+        _card("静默记录缺失", tsg,
+              "takeover 在 mirror 前抛出",
+              _cls_for_count(tsg, bad_at=1)),
     ])
 
 
@@ -242,6 +333,7 @@ def render_section_fragments(result, suggestions, sessions_info):
     container IDs in HTML_TEMPLATE.
     """
     return {
+        "stats-health": render_stats_health(result),
         "stats-openclaw": render_stats_openclaw(result),
         "stats-litellm": render_stats_litellm(result),
         "stats-latency": render_stats_latency(result),
@@ -265,29 +357,7 @@ def print_report(result, sqlite_info, sessions_info=None):
     print(f"  数据来源:  OpenClaw日志 + Litellm日志")
 
     # ── Health Score ──
-    score = 100
-    deductions = []
-    if s["llm_timeouts"] > 0:
-        score -= min(s["llm_timeouts"] * 15, 60)
-        deductions.append(f"LLM超时 {s['llm_timeouts']}次")
-    if s["llm_aborts"] > 0:
-        score -= min(s["llm_aborts"] * 8, 24)
-        deductions.append(f"LLM中断 {s['llm_aborts']}次")
-    if s["litellm_upstream_timeouts"] > 0:
-        score -= min(s["litellm_upstream_timeouts"] * 10, 40)
-        deductions.append(f"Litellm上游超时 {s['litellm_upstream_timeouts']}次")
-    if s["session_stalls"] > 0:
-        score -= min(s["session_stalls"] * 6, 24)
-        deductions.append(f"任务卡住 {s['session_stalls']}次")
-    if s["failovers"] > 0:
-        score -= min(s["failovers"] * 5, 20)
-    if s["incomplete_turns"] > 0:
-        score -= min(s["incomplete_turns"] * 10, 20)
-    if s["context_overflows"] > 5:
-        score -= 5
-    if s["connection_issues"] > 3:
-        score -= 5
-    score = max(score, 0)
+    score, deductions, _color_cls = compute_health_score(s)
     score_color = GREEN if score >= 80 else (YELLOW if score >= 50 else RED)
     print()
     print(f"  健康评分:  {score_color(f'{score}/100')}")
@@ -310,6 +380,12 @@ def print_report(result, sqlite_info, sessions_info=None):
     print(f"     ├─ 会话记录缺失:          {YELLOW(str(_tmf)) if _tmf else GREEN('0')} 条 (送达成功但 transcript 镜像失败)")
     _tsg = s.get("takeover_silent_gaps", 0)
     print(f"     ├─ 静默记录缺失:          {RED(str(_tsg)) if _tsg else GREEN('0')} 条 (takeover 在 mirror 前抛出,无 WARN)")
+    _rsl = s.get("reply_session_stale_locks", 0)
+    print(f"     ├─ Reply session卡死:     {RED(str(_rsl)) if _rsl else GREEN('0')} 次 (compaction 后 lock 绑旧 sessionId,需重启)")
+    _rsi = s.get("reply_session_init_conflicts", 0)
+    _chr = s.get("codex_history_read_failures", 0)
+    _sub = f" (冲突 {_rsi} / 历史读取失败 {_chr})"
+    print(f"     ├─ Codex历史读取失败:     {YELLOW(str(_chr)) if _chr else GREEN('0')} 次{_sub if (_rsi or _chr) and not _rsl else ''}")
     print(f"     ├─ LLM 调用错误:         {RED(str(s['llm_errors'])) if s['llm_errors'] else GREEN('0')} 次")
     print(f"     ├─ LLM 中断:             {YELLOW(str(s['llm_aborts'])) if s['llm_aborts'] else GREEN('0')} 次")
     print(f"     ├─ LLM 超时:             {RED(str(s['llm_timeouts'])) if s['llm_timeouts'] else GREEN('0')} 次")
@@ -574,6 +650,9 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
 
   <div id="error-banner"></div>
 
+  <div class="section-label">健康评分</div>
+  <div class="stats" id="stats-health">{{ stats_health_html|safe }}</div>
+
   <div class="section-label">OpenClaw 网关</div>
   <div class="stats" id="stats-openclaw">{{ stats_openclaw|safe }}</div>
 
@@ -671,7 +750,7 @@ async function fetchData() {
     const savedPageScroll = window.scrollY;
 
     // Patch each section.
-    const sections = ['stats-openclaw', 'stats-litellm', 'stats-latency',
+    const sections = ['stats-health', 'stats-openclaw', 'stats-litellm', 'stats-latency',
                       'stats-sessions', 'time-series', 'suggestions', 'event-list'];
     for (const id of sections) {
       if (data[id] !== undefined) {

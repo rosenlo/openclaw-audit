@@ -687,6 +687,218 @@ def test_takeover_error_silent_gap_classified_and_counted():
     assert warn_cat["type"] == "transcript_mirror_failed"
 
 
+def test_reply_session_init_conflict_classified_and_counted():
+    """The 'message processed: ... reply session initialization conflicted'
+    ERROR must get its own category (reply_session_init_conflict) instead of
+    being bucketed as a generic telegram_out error, so the composite
+    stale-lock detector can group events by sessionKey. Still increments
+    telegram['errors'] so the existing 'Telegram 回复失败' suggestion path
+    keeps working."""
+    from openclaw_audit import analyze, classify_entry
+    msg = (
+        'message processed: channel=telegram chatId=telegram:670530854 '
+        'messageId=6777 sessionId=e1125e5d-fadf-4a44-b324-8595726a2e58 '
+        'sessionKey=agent:main:telegram:direct:670530854 outcome=error '
+        'duration=24ms error="Error: reply session initialization conflicted '
+        'for agent:main:telegram:direct:670530854"'
+    )
+    cat = classify_entry(msg, "ERROR")
+    assert cat["type"] == "reply_session_init_conflict"
+    assert cat["sessionKey"] == "agent:main:telegram:direct:670530854"
+    assert cat["sessionId"] == "e1125e5d-fadf-4a44-b324-8595726a2e58"
+
+    entries = [("openclaw", "2026-07-09T08:48:49.890+08:00", "ERROR", msg)]
+    result = analyze(entries)
+    assert result["reply_session_init_conflicts"] == 1
+    assert result["summary"]["reply_session_init_conflicts"] == 1
+    # Must still bump telegram['errors'] so the existing suggestion path fires.
+    assert result["telegram"]["errors"] == 1
+    # Single conflict in the window does NOT trigger the composite.
+    assert result["reply_session_stale_locks"] == 0
+
+
+def test_codex_history_read_failed_classified_and_counted():
+    """The bare WARN 'failed to read mirrored session history for codex
+    harness hooks' must get its own category so the composite stale-lock
+    detector can find it by time window. The sessionFile is in the
+    structured "1" field which the parser does not surface, so the
+    classifier is a marker only."""
+    from openclaw_audit import analyze, classify_entry
+    msg = "failed to read mirrored session history for codex harness hooks"
+    cat = classify_entry(msg, "WARN")
+    assert cat["type"] == "codex_history_read_failed"
+
+    entries = [("openclaw", "2026-07-09T08:47:22.741+08:00", "WARN", msg)]
+    result = analyze(entries)
+    assert result["codex_history_read_failures"] == 1
+    assert result["summary"]["codex_history_read_failures"] == 1
+    # Lone WARN must NOT trigger the composite.
+    assert result["reply_session_stale_locks"] == 0
+
+
+def test_reply_session_stale_lock_composite_fires_on_burst_with_codex_read():
+    """The composite fires when ≥2 reply_session_init_conflict events on the
+    same sessionKey co-occur with ≥1 codex_history_read_failed in the same
+    10-min window. Reproduces the 2026-07-09 08:47–08:50 incident shape:
+    one codex history WARN at 08:47:22, then 5 conflicts 08:48–08:50."""
+    from openclaw_audit import analyze
+    session_key = "agent:main:telegram:direct:670530854"
+    session_id = "e1125e5d-fadf-4a44-b324-8595726a2e58"
+    conflict_msg = (
+        f'message processed: channel=telegram chatId=telegram:670530854 '
+        f'messageId=6777 sessionId={session_id} sessionKey={session_key} '
+        f'outcome=error duration=24ms error="Error: reply session '
+        f'initialization conflicted for {session_key}"'
+    )
+    codex_msg = "failed to read mirrored session history for codex harness hooks"
+    entries = [
+        # Leading codex history WARN at 08:47:22.
+        ("openclaw", "2026-07-09T08:47:22.741+08:00", "WARN", codex_msg),
+        # 5 conflicts within 77 seconds.
+        ("openclaw", "2026-07-09T08:48:49.890+08:00", "ERROR", conflict_msg),
+        ("openclaw", "2026-07-09T08:48:55.195+08:00", "ERROR", conflict_msg),
+        ("openclaw", "2026-07-09T08:49:05.718+08:00", "ERROR", conflict_msg),
+        ("openclaw", "2026-07-09T08:49:26.266+08:00", "ERROR", conflict_msg),
+        ("openclaw", "2026-07-09T08:50:06.879+08:00", "ERROR", conflict_msg),
+    ]
+    result = analyze(entries)
+    assert result["reply_session_init_conflicts"] == 5
+    assert result["codex_history_read_failures"] == 1
+    assert result["reply_session_stale_locks"] == 1
+    assert result["summary"]["reply_session_stale_locks"] == 1
+
+    # Composite event must be present in raw_events.
+    composite = [ev for ev in result["raw_events"]
+                if ev["type"] == "🔓 Reply session卡死"]
+    assert len(composite) == 1
+    assert composite[0]["level"] == "ERROR"
+    assert session_key in composite[0]["detail"]
+
+    # Suggestion + root-cause must surface the composite.
+    suggestions = build_suggestions(result, result.get("telegram", {}))
+    assert any("Reply session 卡死" in s for s in suggestions)
+    summary = build_root_cause_summary(result)
+    assert "Reply session 卡死" in summary
+
+    # Health score must be deducted (otherwise the 100/100 miss we saw in
+    # the live incident would recur). With 1 stale-lock burst the cap is
+    # 15 points, so score <= 85.
+    from openclaw_audit import print_report
+    # We can't easily capture stdout here, but the deduction is computed
+    # inline; just check the summary counter that drives it.
+    assert result["summary"]["reply_session_stale_locks"] >= 1
+
+
+def test_reply_session_stale_lock_does_not_fire_without_codex_read():
+    """A conflict burst with no codex_history_read_failed in the same window
+    must NOT trigger the composite — the codex WARN is the leading
+    indicator that the failure is session-state, not a Telegram send-chain
+    problem. Without it the conflicts stay classified as plain
+    reply_session_init_conflict events (still surfaced as Telegram 回复失败)."""
+    from openclaw_audit import analyze
+    session_key = "agent:main:telegram:direct:670530854"
+    session_id = "abc12345-0000-0000-0000-000000000001"
+    conflict_msg = (
+        f'message processed: channel=telegram chatId=telegram:670530854 '
+        f'messageId=6777 sessionId={session_id} sessionKey={session_key} '
+        f'outcome=error duration=24ms error="Error: reply session '
+        f'initialization conflicted for {session_key}"'
+    )
+    entries = [
+        ("openclaw", "2026-07-09T08:48:49.890+08:00", "ERROR", conflict_msg),
+        ("openclaw", "2026-07-09T08:48:55.195+08:00", "ERROR", conflict_msg),
+    ]
+    result = analyze(entries)
+    assert result["reply_session_init_conflicts"] == 2
+    assert result["reply_session_stale_locks"] == 0
+
+
+def test_reply_session_stale_lock_does_not_fire_across_window_boundary():
+    """Two conflicts more than 10 minutes apart must NOT merge into a single
+    burst, even if a codex_history_read_failed happens between them. The
+    composite requires the conflicts to be in the same window."""
+    from openclaw_audit import analyze
+    session_key = "agent:main:telegram:direct:670530854"
+    session_id = "abc12345-0000-0000-0000-000000000002"
+    conflict_msg = (
+        f'message processed: channel=telegram chatId=telegram:670530854 '
+        f'messageId=6777 sessionId={session_id} sessionKey={session_key} '
+        f'outcome=error duration=24ms error="Error: reply session '
+        f'initialization conflicted for {session_key}"'
+    )
+    codex_msg = "failed to read mirrored session history for codex harness hooks"
+    entries = [
+        ("openclaw", "2026-07-09T08:00:00.000+08:00", "ERROR", conflict_msg),
+        ("openclaw", "2026-07-09T08:00:30.000+08:00", "WARN", codex_msg),
+        # 15 min later — outside the 10-min window.
+        ("openclaw", "2026-07-09T08:15:00.000+08:00", "ERROR", conflict_msg),
+    ]
+    result = analyze(entries)
+    assert result["reply_session_init_conflicts"] == 2
+    assert result["reply_session_stale_locks"] == 0
+
+
+def test_raw_events_sorted_newest_first_with_out_of_order_composite():
+    """Regression: the composite event is appended AFTER the main loop, so
+    a naive `reverse()` would put it at the top of the list regardless of
+    its real timestamp. Observed 2026-07-09: an 08:50 composite appeared
+    above a 09:38 event, breaking newest-first ordering. The fix sorts
+    raw_events by ISO time descending, so the composite lands at its real
+    position (next to its component conflict events, NOT above newer
+    unrelated events)."""
+    from openclaw_audit import analyze
+    session_key = "agent:main:telegram:direct:670530854"
+    session_id = "abc12345-0000-0000-0000-000000000005"
+    conflict_msg = (
+        f'message processed: channel=telegram chatId=telegram:670530854 '
+        f'messageId=6777 sessionId={session_id} sessionKey={session_key} '
+        f'outcome=error duration=24ms error="Error: reply session '
+        f'initialization conflicted for {session_key}"'
+    )
+    codex_msg = "failed to read mirrored session history for codex harness hooks"
+    # An unrelated WARN that is NEWER than the entire burst. This event
+    # is processed in the main loop BEFORE the composite is appended (the
+    # composite is appended post-loop). With the old `reverse()` the
+    # composite (08:50) would land at index 0, above this 09:38 event.
+    newer_unrelated_warn = (
+        'tool "wealth.summary" from server "wealthos" registered as '
+        '"wealthos__wealth-summary" to keep the tool name provider-safe.'
+    )
+    entries = [
+        # 08:47 — leading codex history WARN.
+        ("openclaw", "2026-07-09T08:47:22.741+08:00", "WARN", codex_msg),
+        # 08:48-08:50 — conflict burst (5 events).
+        ("openclaw", "2026-07-09T08:48:49.890+08:00", "ERROR", conflict_msg),
+        ("openclaw", "2026-07-09T08:48:55.195+08:00", "ERROR", conflict_msg),
+        ("openclaw", "2026-07-09T08:49:05.718+08:00", "ERROR", conflict_msg),
+        ("openclaw", "2026-07-09T08:49:26.266+08:00", "ERROR", conflict_msg),
+        ("openclaw", "2026-07-09T08:50:06.879+08:00", "ERROR", conflict_msg),
+        # 09:38 — newer unrelated WARN. Must sort ABOVE the 08:50 composite.
+        ("openclaw", "2026-07-09T09:38:06.000+08:00", "WARN", newer_unrelated_warn),
+    ]
+    result = analyze(entries)
+    assert result["reply_session_stale_locks"] == 1
+    events = result["raw_events"]
+    # Find positions of the 09:38 warn and the 08:50 composite.
+    pos_newer = None
+    pos_composite = None
+    for idx, ev in enumerate(events):
+        ts = ev.get("time", "")
+        if "09:38:06" in ts and "wealth.summary" in ev.get("detail", ""):
+            pos_newer = idx
+        if ev.get("type") == "🔓 Reply session卡死":
+            pos_composite = idx
+    assert pos_newer is not None, "newer unrelated WARN not found in events"
+    assert pos_composite is not None, "composite event not found"
+    # Newest first: the 09:38 event must appear BEFORE the 08:50 composite
+    # (lower index = newer). The old reverse() bug put the composite at
+    # index 0, above this 09:38 event.
+    assert pos_newer < pos_composite, (
+        f"newer event (09:38) at index {pos_newer} must come before "
+        f"composite (08:50) at index {pos_composite} in newest-first order"
+    )
+
+
 def test_truncate_helper_marks_truncation():
     """`_truncate` must append an ellipsis when the input exceeds the limit
     so a clipped path/error message is not mistaken for the full string.
@@ -1261,7 +1473,7 @@ def test_format_event_time_handles_iso_text_and_empty():
 
 # ─── Web: render_section_fragments (Fix A) ─────────────────────────────
 def test_render_section_fragments_returns_all_sections():
-    """The /api/fragments endpoint must return all 7 section IDs that the
+    """The /api/fragments endpoint must return all 8 section IDs that the
     JS expects to patch. Adding/removing a section without updating both
     sides silently breaks refresh."""
     from openclaw_audit.render import render_section_fragments
@@ -1271,7 +1483,7 @@ def test_render_section_fragments_returns_all_sections():
     fragments = render_section_fragments(result, ["✅ ok"], {"active": []})
 
     expected = {
-        "stats-openclaw", "stats-litellm", "stats-latency",
+        "stats-health", "stats-openclaw", "stats-litellm", "stats-latency",
         "stats-sessions", "time-series", "suggestions", "event-list",
     }
     assert set(fragments.keys()) == expected, (
@@ -1294,6 +1506,130 @@ def test_render_section_fragments_latency_uses_units():
     assert "12.3s" in fragments["stats-latency"], (
         f"expected '12.3s' in latency fragment, got: {fragments['stats-latency']!r}"
     )
+
+
+def test_render_stats_openclaw_shows_session_state_cards():
+    """The web dashboard's OpenClaw stats row must surface all four
+    session-state failure cards: Reply session 卡死, Codex 历史读取失败,
+    会话记录缺失, 静默记录缺失. These mirror the CLI's 总体指标 lines so
+    the web operator sees the #88838 family at a glance instead of
+    having to scroll the event list."""
+    from openclaw_audit.render import render_stats_openclaw
+    from openclaw_audit import analyze
+
+    # Build a result with each session-state failure populated.
+    session_key = "agent:main:telegram:direct:670530854"
+    session_id = "abc12345-0000-0000-0000-000000000003"
+    conflict_msg = (
+        f'message processed: channel=telegram chatId=telegram:670530854 '
+        f'messageId=6777 sessionId={session_id} sessionKey={session_key} '
+        f'outcome=error duration=24ms error="Error: reply session '
+        f'initialization conflicted for {session_key}"'
+    )
+    codex_msg = "failed to read mirrored session history for codex harness hooks"
+    mirror_msg = (
+        "failed to mirror outbound delivery into session transcript; "
+        "channel send already succeeded: session file changed while embedded "
+        "prompt lock was released: /Users/rosen/.openclaw/agents/main/sessions/x.jsonl"
+    )
+    takeover_msg = (
+        'lane task error: lane=session:agent:main:telegram:direct:670530854 '
+        'durationMs=91506 error="EmbeddedAttemptSessionTakeoverError: session '
+        'file changed while embedded prompt lock was released: '
+        '/Users/rosen/.openclaw/agents/main/sessions/x.jsonl"'
+    )
+    entries = [
+        # codex history WARN precedes conflict burst (leading signal).
+        ("openclaw", "2026-07-09T08:47:22.741+08:00", "WARN", codex_msg),
+        ("openclaw", "2026-07-09T08:48:49.890+08:00", "ERROR", conflict_msg),
+        ("openclaw", "2026-07-09T08:48:55.195+08:00", "ERROR", conflict_msg),
+        ("openclaw", "2026-07-09T08:49:00.000+08:00", "WARN", mirror_msg),
+        ("openclaw", "2026-07-09T08:49:30.000+08:00", "ERROR", takeover_msg),
+    ]
+    result = analyze(entries)
+    assert result["reply_session_stale_locks"] == 1
+    assert result["transcript_mirror_failures"] == 1
+    assert result["takeover_silent_gaps"] == 1
+
+    html = render_stats_openclaw(result)
+    # All four card labels must be present.
+    assert "Reply session 卡死" in html
+    assert "Codex 历史读取失败" in html
+    assert "会话记录缺失" in html
+    assert "静默记录缺失" in html
+    # The counts must render inside the cards.
+    assert ">1<" in html  # reply_session_stale_locks = 1
+    # The composite must trigger the bad class (red) — bad_at=1.
+    # Render is `class="value bad"`. Just check the card is present with
+    # the right label by finding the label followed by a value of 1.
+    # Cheap and stable across CSS tweaks.
+    label_idx = html.find("Reply session 卡死")
+    assert label_idx >= 0
+    # The count appears after the label in the same card.
+    assert ">1<" in html[label_idx:label_idx + 200]
+
+
+def test_render_stats_health_shows_score_and_deductions():
+    """The web dashboard must surface a 健康评分 card that mirrors the CLI's
+    `健康评分: NN/100  扣分原因: ...` line. The score is the headline number;
+    deduction reasons appear as a sublabel so the operator sees why without
+    reading the event list. This is required because the score is the
+    single most-looked-at summary number and was previously only in the
+    CLI report — the web dashboard always rendered 0/100 implicitly
+    (the panel was simply missing).
+
+    Score thresholds match the CLI:
+      - score >= 80 → green (good)
+      - 50 <= score < 80 → yellow (warn)
+      - score < 50 → red (bad)
+    """
+    from openclaw_audit.render import render_stats_health
+    from openclaw_audit import analyze
+
+    # 1 stale-lock burst → 100 - 15 = 85 → green (>=80).
+    session_key = "agent:main:telegram:direct:670530854"
+    session_id = "abc12345-0000-0000-0000-000000000004"
+    conflict_msg = (
+        f'message processed: channel=telegram chatId=telegram:670530854 '
+        f'messageId=6777 sessionId={session_id} sessionKey={session_key} '
+        f'outcome=error duration=24ms error="Error: reply session '
+        f'initialization conflicted for {session_key}"'
+    )
+    codex_msg = "failed to read mirrored session history for codex harness hooks"
+    entries = [
+        ("openclaw", "2026-07-09T08:47:22.741+08:00", "WARN", codex_msg),
+        ("openclaw", "2026-07-09T08:48:49.890+08:00", "ERROR", conflict_msg),
+        ("openclaw", "2026-07-09T08:48:55.195+08:00", "ERROR", conflict_msg),
+    ]
+    result = analyze(entries)
+    html = render_stats_health(result)
+    assert "健康评分" in html
+    assert "85/100" in html
+    # Deduction reason must surface as a sublabel.
+    assert "Reply session卡死" in html
+    # Color class for 85 must be 'good' (green, >= 80).
+    assert "value good" in html
+
+    # 2 stale-lock bursts on different keys would still be capped at 25 —
+    # verify the red boundary by simulating many LLM timeouts. 5 timeouts
+    # → min(5 * 15, 60) = 60 → score 40 → red (<50).
+    entries2 = [
+        ("openclaw", f"2026-07-09T0{n}:00:00.000+08:00", "ERROR",
+         "LLM request timed out durationMs=30000")
+        for n in range(5)
+    ]
+    result2 = analyze(entries2)
+    html2 = render_stats_health(result2)
+    assert "40/100" in html2
+    assert "LLM超时" in html2
+    # 40 < 50 → red (bad).
+    assert "value bad" in html2
+
+    # Empty window → 100/100, green, no deductions sublabel content.
+    result3 = analyze([])
+    html3 = render_stats_health(result3)
+    assert "100/100" in html3
+    assert "value good" in html3
 
 
 # ─── Web: /api/fragments and /api/data endpoints (Fix A, C, E) ───────
