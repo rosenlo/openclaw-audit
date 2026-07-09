@@ -60,6 +60,23 @@ def classify_entry(msg, level):
             cat["chars"] = 0
         return cat
 
+    # Reply session initialization conflicted — repeated conflicts on the
+    # same sessionKey indicate the reply session lock is wedged on a stale
+    # sessionId (typically because compaction rotated the session file but
+    # the reply session binding was never refreshed). The user-facing
+    # Telegram send for the previous turn usually succeeded, so this is
+    # NOT a Telegram send-chain failure — it is a session-state failure.
+    # Pairs with codex_history_read_failed (same time window) to produce
+    # the reply_session_stale_lock composite (detected in analyze.py).
+    if (
+        "message processed" in ml
+        and "telegram" in ml
+        and "reply session initialization conflicted" in ml
+    ):
+        cat["type"] = "reply_session_init_conflict"
+        cat.update(_extract_fields(msg, ["sessionId", "sessionKey"]))
+        return cat
+
     if "message processed" in ml and "telegram" in ml:
         cat["type"] = "telegram_out"
         if "outcome=error" in ml:
@@ -98,6 +115,19 @@ def classify_entry(msg, level):
                 cat["chat_id"] = part.split("=", 1)[1]
             elif part.startswith("chat="):
                 cat["chat_id"] = part.split("=", 1)[1]
+        return cat
+
+    # Codex harness hooks failed to read the mirrored session history.
+    # This is a WARN (not an error), but it is the leading signal that
+    # the session file no longer matches what the embedded run expects —
+    # often because compaction rotated it mid-turn. The sessionFile path
+    # (containing the sessionId) is in the structured "1" field which the
+    # parser does not surface, so this classifier is a marker only; the
+    # composite detection in analyze.py links it to reply_session_init_conflict
+    # events via time-window coincidence (the WARN is rare enough that
+    # same-window co-occurrence with a conflict burst is a strong signal).
+    if "failed to read mirrored session history" in ml and "codex harness hooks" in ml:
+        cat["type"] = "codex_history_read_failed"
         return cat
 
     # Outbound delivery was mirrored into the session transcript, but the

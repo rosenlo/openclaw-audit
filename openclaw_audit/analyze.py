@@ -1,6 +1,6 @@
 """Core analysis: aggregate parsed entries into the audit result dict."""
 
-from collections import Counter
+from collections import Counter, defaultdict
 
 from .classify import classify_entry, classify_litellm_entry
 from .util import _truncate
@@ -11,6 +11,89 @@ from .util import fmt_duration, parse_ts
 # ─── 核心分析 ──────────────────────────────────────────────────────
 NON_FATAL_LITELLM_TYPES = {"deprecation_warning", "general_error", "other"}
 
+# Window for grouping reply_session_init_conflict events into a single
+# "stale lock" burst. The observed 2026-07-09 incident produced 5 conflicts
+# in ~77 seconds; a 10-minute window is generous enough to capture slow
+# bursts but tight enough that unrelated conflicts on the same key (hours
+# apart) do not get merged.
+STALE_LOCK_WINDOW_SEC = 600
+
+# Minimum conflict count within the window to qualify as a burst. 2 is
+# the lowest non-noise threshold — a single conflict can be a transient
+# race; ≥2 on the same sessionKey in 10 min is the observed failure mode.
+STALE_LOCK_MIN_CONFLICTS = 2
+
+
+def _detect_stale_lock_bursts(conflicts_by_key, codex_read_ts, raw_events):
+    """Detect reply_session_stale_lock bursts and append composite events.
+
+    Returns the burst count. A burst is ≥ STALE_LOCK_MIN_CONFLICTS
+    reply_session_init_conflict events on the same sessionKey within
+    STALE_LOCK_WINDOW_SEC, co-occurring with ≥1 codex_history_read_failed
+    WARN within STALE_LOCK_WINDOW_SEC of the burst (forward or backward —
+    the codex WARN is typically a leading signal logged when the
+    embedded run starts and reads a stale mirrored history, so it
+    precedes the first conflict by up to a few minutes).
+
+    The composite event is appended to ``raw_events`` and uses the last
+    conflict's original ISO ts_str as its ``time`` field so the final
+    time-descending sort places it next to its component conflict events
+    (NOT at the top of the list by append order — that used to put an
+    08:50 composite above a 09:38 event, which broke newest-first
+    ordering in the rendered event list).
+    """
+    bursts = 0
+    codex_sorted = sorted(codex_read_ts)
+    for session_key, conflicts in conflicts_by_key.items():
+        if len(conflicts) < STALE_LOCK_MIN_CONFLICTS:
+            continue
+        # Sliding window: sort conflicts by time, then group events
+        # within STALE_LOCK_WINDOW_SEC of the first event in the burst.
+        conflicts_sorted = sorted(conflicts, key=lambda x: x[0])
+        i = 0
+        n = len(conflicts_sorted)
+        while i < n:
+            window_start = conflicts_sorted[i][0]
+            # Collect all conflicts within STALE_LOCK_WINDOW_SEC of window_start.
+            j = i
+            while j < n and (conflicts_sorted[j][0] - window_start).total_seconds() <= STALE_LOCK_WINDOW_SEC:
+                j += 1
+            burst = conflicts_sorted[i:j]
+            i = j
+            if len(burst) < STALE_LOCK_MIN_CONFLICTS:
+                continue
+            burst_end = burst[-1][0]
+            # Look for a codex_read_ts within STALE_LOCK_WINDOW_SEC of
+            # [window_start, burst_end] (lookback + lookahead). The codex
+            # WARN is the leading indicator and typically precedes the
+            # first conflict by 1-2 min, so a lookback is required.
+            has_codex_read = any(
+                -STALE_LOCK_WINDOW_SEC <= (cts - window_start).total_seconds() <= STALE_LOCK_WINDOW_SEC
+                or -STALE_LOCK_WINDOW_SEC <= (cts - burst_end).total_seconds() <= STALE_LOCK_WINDOW_SEC
+                for cts in codex_sorted
+            )
+            if not has_codex_read:
+                continue
+            # Burst detected. Use the last conflict's original ts_str so
+            # the final time-descending sort lands the composite next to
+            # its component conflict events, not at the top of the list
+            # by append order.
+            bursts += 1
+            last_ts_str = burst[-1][2]
+            raw_events.append({
+                "source": "openclaw", "time": last_ts_str,
+                "type": "🔓 Reply session卡死",
+                "detail": (
+                    f"sessionKey={session_key} 同窗口 ≥2 次 reply session "
+                    f"initialization conflicted + codex harness history 读取失败 "
+                    f"→ reply session 锁绑定的 sessionId 已被 compaction 轮转,"
+                    f"但 lock 没释放 (重启才能恢复)"
+                ),
+                "level": "ERROR"
+            })
+    return bursts
+
+
 def analyze(entries, since=None):
     result = {
         "summary": {},
@@ -20,6 +103,9 @@ def analyze(entries, since=None):
         "stalls": 0,
         "transcript_mirror_failures": 0,
         "takeover_silent_gaps": 0,
+        "reply_session_init_conflicts": 0,
+        "codex_history_read_failures": 0,
+        "reply_session_stale_locks": 0,
         "failovers": 0, "connection_issues": 0, "config_reloads": 0,
         "tool_errors": {"edit": 0, "read": 0},
         "incomplete_turns": 0, "other_errors": [],
@@ -40,6 +126,19 @@ def analyze(entries, since=None):
 
     hourly_counts = Counter()
     litellm_err_counts = Counter()
+
+    # Per-sessionKey conflict timestamps (parsed_ts, sessionId, original
+    # ts_str) for the stale-lock composite post-pass. sessionId may be
+    # "unknown" — the composite still works via time-window coincidence
+    # with codex_history_read_failed. The original ts_str is preserved so
+    # the composite event can use the same sortable ISO format as real
+    # log events (the post-pass sorts raw_events by time descending, not
+    # by append order, so the format must match for the sort to land the
+    # composite next to its component conflict events).
+    conflicts_by_session_key = defaultdict(list)
+    # Timestamps of codex_history_read_failed WARN events (no sessionKey
+    # in the bare message — window-only match).
+    codex_history_read_ts = []
 
     for source, ts_str, level, msg in entries:
         parsed_ts = parse_ts(ts_str)
@@ -98,6 +197,39 @@ def analyze(entries, since=None):
                     "type": "🔇 静默会话记录缺失",
                     "detail": "EmbeddedAttemptSessionTakeoverError 在 lane task / cleanup 路径抛出,mirror 未被调用,transcript 缺失但无 failed to mirror WARN",
                     "level": "ERROR"
+                })
+
+            elif etype == "reply_session_init_conflict":
+                # Count toward telegram["errors"] so the existing "Telegram
+                # 回复失败" suggestion still fires for the dispatch failure,
+                # but also track per-sessionKey for the stale-lock composite.
+                result["telegram"]["errors"] += 1
+                result["reply_session_init_conflicts"] += 1
+                sk = cat.get("sessionKey", "")
+                if sk and parsed_ts:
+                    conflicts_by_session_key[sk].append(
+                        (parsed_ts, cat.get("sessionId", ""), ts_str)
+                    )
+                result["raw_events"].append({
+                    "source": "openclaw", "time": ts_str,
+                    "type": "🔒 Reply session冲突",
+                    "detail": _truncate(msg, 400),
+                    "level": "ERROR"
+                })
+
+            elif etype == "codex_history_read_failed":
+                # WARN-level signal: the embedded run's view of the session
+                # file is stale. Tracked for the stale-lock composite; also
+                # surfaced as a WARN event so the operator sees the leading
+                # indicator even when the composite has not yet fired.
+                result["codex_history_read_failures"] += 1
+                if parsed_ts:
+                    codex_history_read_ts.append(parsed_ts)
+                result["raw_events"].append({
+                    "source": "openclaw", "time": ts_str,
+                    "type": "📜 Codex历史读取失败",
+                    "detail": "embedded run 读取 mirrored session history 失败 (session file 可能已被 compaction 轮转)",
+                    "level": "WARN"
                 })
 
             elif etype == "llm_error":
@@ -327,6 +459,23 @@ def analyze(entries, since=None):
     result["litellm"]["streaming_responses"] = litellm_out["streaming_responses"]
     result["litellm"]["status_codes"] = dict(litellm_out["status_codes"])
 
+    # ── Composite: reply_session_stale_lock ──
+    # A burst of ≥2 reply_session_init_conflict events on the same
+    # sessionKey within STALE_LOCK_WINDOW_SEC, plus ≥1 codex_history_read_failed
+    # WARN in the same window, indicates the reply session lock is wedged
+    # on a stale sessionId after compaction rotated the underlying file.
+    # The Telegram send chain itself is fine (the previous turn usually
+    # delivered); the failure is in session-state bookkeeping. Without
+    # this composite the operator sees "Telegram 回复失败" (misleading —
+    # the send chain is healthy) and a bare "Codex历史读取失败" WARN,
+    # with no link between them.
+    if conflicts_by_session_key and codex_history_read_ts:
+        result["reply_session_stale_locks"] = _detect_stale_lock_bursts(
+            conflicts_by_session_key,
+            codex_history_read_ts,
+            result["raw_events"],
+        )
+
     # ── Summary ──
     total_events = len(entries)
     result["summary"] = {
@@ -345,6 +494,9 @@ def analyze(entries, since=None):
         "connection_issues": result["connection_issues"],
         "transcript_mirror_failures": result["transcript_mirror_failures"],
         "takeover_silent_gaps": result["takeover_silent_gaps"],
+        "reply_session_init_conflicts": result["reply_session_init_conflicts"],
+        "codex_history_read_failures": result["codex_history_read_failures"],
+        "reply_session_stale_locks": result["reply_session_stale_locks"],
         "config_reloads": result["config_reloads"],
         "edit_fails": result["tool_errors"]["edit"],
         "avg_llm_latency": None,
@@ -366,6 +518,16 @@ def analyze(entries, since=None):
         result["summary"]["p95_llm_latency"] = lats[min(idx95, len(lats)-1)]
 
     result["time_series"] = dict(sorted(hourly_counts.items()))
-    result["raw_events"].reverse()
+    # Sort raw_events by time descending (newest first). The previous
+    # `reverse()` assumed raw_events were appended in chronological order,
+    # but the reply_session_stale_lock composite is appended AFTER the
+    # main loop with a ts that may be older than later-processed events —
+    # reverse() would put it at the top regardless of its real timestamp.
+    # ISO 8601 strings sort lexically = chronologically (all events share
+    # the same tz offset from one host, so the offset never breaks the
+    # lexical order). Stable sort preserves insertion order for events
+    # at the same second, keeping the composite just after its component
+    # conflict events.
+    result["raw_events"].sort(key=lambda ev: ev.get("time", ""), reverse=True)
 
     return result

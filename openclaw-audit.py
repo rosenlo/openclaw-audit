@@ -203,6 +203,7 @@ def web_mode(args):
             HTML_TEMPLATE,
             sel=since_param,
             generated_at=payload["generated_at"],
+            stats_health_html=payload.get("stats-health", ""),
             stats_openclaw=payload.get("stats-openclaw", ""),
             stats_litellm=payload.get("stats-litellm", ""),
             stats_latency=payload.get("stats-latency", ""),
