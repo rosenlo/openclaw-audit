@@ -18,3 +18,20 @@ This repo is a small, mostly self-contained audit tool for local OpenClaw setups
 - Keep examples runnable with plain `python3`.
 - Be careful not to reintroduce hardcoded personal identifiers or machine paths.
 - If you add new outputs, keep privacy in mind because logs may contain personal conversation metadata.
+
+## Cross-session Memory
+
+This repo uses a cross-session memory system under `memory/`. Both
+OpenCode and Claude Code read/write the same files.
+
+- @memory/MEMORY.md — index of all notes (read at session start)
+- @memory/gotchas.md — runtime traps and investigation pitfalls (READ before touching parsers or investigation docs)
+- @memory/decisions.md — audit-scope and upstream-PR decisions
+- @memory/topology.md — repo layout, remotes, related repos (openclaw fork)
+- @memory/ops.md — commands and verification queries
+- @memory/pr-workflow.md — branch/PR workflow for this audit repo and the upstream fork
+
+When you discover something durable, append to the right `memory/*.md`
+file using the entry template. Don't ask the user — just write if it's
+clearly durable. The OpenCode `memory.js` plugin reminds you at
+`session.idle` and `session.compacting`.

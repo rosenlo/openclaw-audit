@@ -11,3 +11,4 @@ build/
 *.egg-info/
 audit.err.log
 audit.out.log
+.claude/worktrees/
